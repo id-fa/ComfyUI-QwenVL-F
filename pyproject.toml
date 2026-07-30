@@ -6,10 +6,11 @@ license = {file = "LICENSE"}
 dependencies = ["transformers", "torch", "huggingface-hub", "hf_xet", "psutil", "numpy", "Pillow", "opencv-python", "bitsandbytes", "accelerate"]
 
 [project.urls]
-Repository = "https://github.com/id-fa/ComfyUI-QwenVL"
+Repository = "https://github.com/id-fa/ComfyUI-QwenVL-F"
 
 [tool.comfy]
 PublisherId = "id-fa"
 DisplayName = "QwenVL-F"
 Icon = ""
+Repository = "https://github.com/id-fa/ComfyUI-QwenVL-F"
 
