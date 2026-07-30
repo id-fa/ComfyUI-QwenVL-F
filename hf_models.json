@@ -1,4 +1,6 @@
 {
+  "_comment": "Only 'base_dirs' is read by the nodes: every listed folder is scanned to build the dropdowns, and nothing is downloaded automatically. Entries are folder_paths keys (so extra_model_paths.yaml applies), plain ComfyUI/models subfolders, or absolute paths. The model entries below are unused — kept as a reference list of where to download checkpoints from by hand.",
+  "base_dirs": ["text_encoders", "LLM"],
   "hf_vl_models": {
     "Qwen3-VL-2B-Instruct": {
       "repo_id": "Qwen/Qwen3-VL-2B-Instruct",

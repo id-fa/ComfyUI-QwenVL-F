@@ -1,5 +1,6 @@
 {
-  "base_dir": "LLM",
+  "_comment": "Only 'base_dirs' is read by the nodes: every listed folder is scanned to build the dropdowns, and nothing is downloaded automatically. Entries are folder_paths keys (so extra_model_paths.yaml applies), plain ComfyUI/models subfolders, or absolute paths. The repo entries below are unused — kept as a reference list of where to download .gguf files from by hand.",
+  "base_dirs": ["text_encoders", "LLM"],
   "Qwen_model": {
     "Qwen3-4B-GGUF": {
       "author": "Qwen",

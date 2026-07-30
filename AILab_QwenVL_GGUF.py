@@ -2,7 +2,9 @@
 # GGUF nodes powered by llama.cpp for Qwen-VL models, including Qwen3-VL and Qwen2.5-VL.
 # Provides vision-capable GGUF inference and prompt execution.
 #
-# Models are loaded via llama-cpp-python and configured through gguf_models.json.
+# Models are loaded via llama-cpp-python from .gguf files already present under
+# the configured base dirs (models/text_encoders and models/LLM by default);
+# nothing is downloaded automatically.
 # This integration script follows GPL-3.0 License.
 # When using or modifying this code, please respect both the original model licenses
 # and this integration's license terms.
@@ -14,19 +16,16 @@ import gc
 import io
 import inspect
 import json
-import os
-import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import torch
-from huggingface_hub import hf_hub_download
 from PIL import Image
 
-import folder_paths
 from AILab_OutputCleaner import OutputCleanConfig, clean_model_output
+import AILab_ModelScan as model_scan
 
 NODE_DIR = Path(__file__).parent
 CONFIG_PATH = NODE_DIR / "hf_models.json"
@@ -66,145 +65,56 @@ def _load_prompt_config():
 PRESET_PROMPTS, SYSTEM_PROMPTS = _load_prompt_config()
 
 
+MMPROJ_AUTO = "auto"
+
+TOOLTIPS = {
+    "model_name": "Pick a .gguf already present under models/text_encoders or models/LLM. Nothing is downloaded automatically — copy the file in yourself, then reload ComfyUI.",
+    "mmproj_name": "Vision projector to pair with the model. auto picks the first *mmproj*.gguf sitting next to it.",
+}
+
+
 @dataclass(frozen=True)
 class GGUFVLResolved:
     display_name: str
-    repo_id: str | None
-    alt_repo_ids: list[str]
-    author: str | None
-    repo_dirname: str
-    model_filename: str
-    mmproj_filename: str | None
-    context_length: int
-    image_max_tokens: int
-    image_min_tokens: int
-    n_batch: int
-    gpu_layers: int
-    top_k: int
-    pool_size: int
+    model_path: Path
+    mmproj_path: Path | None
+    context_length: int = 8192
+    image_max_tokens: int = 8192
+    image_min_tokens: int = 1024
+    n_batch: int = 8192
+    gpu_layers: int = -1
+    top_k: int = 0
+    pool_size: int = 4194304
 
 
-def _resolve_base_dir(base_dir_value: str) -> Path:
-    base_dir = Path(base_dir_value)
-    if base_dir.is_absolute():
-        return base_dir
-    # Check extra_model_paths.yaml via folder_paths
-    folder_key = base_dir.parts[0] if base_dir.parts else base_dir_value
-    sub_path = Path(*base_dir.parts[1:]) if len(base_dir.parts) > 1 else Path()
-    if folder_key in folder_paths.folder_names_and_paths:
-        paths = folder_paths.get_folder_paths(folder_key)
-        if paths:
-            return Path(paths[0]) / sub_path
-    return Path(folder_paths.models_dir) / base_dir
-
-
-def _safe_dirname(value: str) -> str:
-    value = (value or "").strip()
-    if not value:
-        return "unknown"
-    return "".join(ch for ch in value if ch.isalnum() or ch in "._- ").strip() or "unknown"
-
-
-def _model_name_to_filename_candidates(model_name: str) -> set[str]:
-    raw = (model_name or "").strip()
-    if not raw:
-        return set()
-    candidates = {raw, f"{raw}.gguf"}
-    if " / " in raw:
-        tail = raw.split(" / ", 1)[1].strip()
-        candidates.update({tail, f"{tail}.gguf"})
-    if "/" in raw:
-        tail = raw.rsplit("/", 1)[-1].strip()
-        candidates.update({tail, f"{tail}.gguf"})
-    return candidates
-
-
-def _load_gguf_vl_catalog():
-    if not GGUF_CONFIG_PATH.exists():
-        return {"base_dir": "LLM", "models": {}}
-    try:
-        with open(GGUF_CONFIG_PATH, "r", encoding="utf-8") as fh:
-            data = json.load(fh) or {}
-    except Exception as exc:
-        print(f"[QwenVL] gguf_models.json load failed: {exc}")
-        return {"base_dir": "LLM", "models": {}}
-
-    base_dir = data.get("base_dir") or "LLM"
-
-    flattened: dict[str, dict] = {}
-
-    repos = data.get("qwenVL_model") or data.get("vl_repos") or data.get("repos") or {}
-    seen_display_names: set[str] = set()
-    for repo_key, repo in repos.items():
-        if not isinstance(repo, dict):
-            continue
-        author = repo.get("author") or repo.get("publisher")
-        repo_name = repo.get("repo_name") or repo.get("repo_name_override") or repo_key
-        repo_id = repo.get("repo_id") or (f"{author}/{repo_name}" if author and repo_name else None)
-        alt_repo_ids = repo.get("alt_repo_ids") or []
-
-        defaults = repo.get("defaults") or {}
-        mmproj_file = repo.get("mmproj_file")
-        model_files = repo.get("model_files") or []
-
-        for model_file in model_files:
-            display = Path(model_file).name
-            if display in seen_display_names:
-                display = f"{display} ({repo_key})"
-            seen_display_names.add(display)
-            flattened[display] = {
-                **defaults,
-                "author": author,
-                "repo_dirname": repo_name,
-                "repo_id": repo_id,
-                "alt_repo_ids": alt_repo_ids,
-                "filename": model_file,
-                "mmproj_filename": mmproj_file,
-            }
-
-    legacy_models = data.get("models") or {}
-    for name, entry in legacy_models.items():
-        if isinstance(entry, dict):
-            flattened[name] = entry
-
-    return {"base_dir": base_dir, "models": flattened}
-
-
-GGUF_VL_CATALOG = _load_gguf_vl_catalog()
-
-LOCAL_PREFIX = "[local] "
+GGUF_BASE_DIRS: list[str] = model_scan.read_base_dirs(GGUF_CONFIG_PATH)
+LOCAL_GGUF_MODELS: dict[str, Path] = {}
+LOCAL_MMPROJ_FILES: dict[str, Path] = {}
 
 
 def _is_gemma_model_name(name: str) -> bool:
-    """Detect Gemma models by filename substring (covers catalog keys and [local] paths)."""
+    """Detect Gemma models by filename substring (covers relative paths)."""
     return "gemma" in (name or "").lower()
 
 
-def _scan_local_gguf_files() -> dict[str, Path]:
-    """Scan base_dir for .gguf files not already in the catalog."""
-    base_dir = _resolve_base_dir(GGUF_VL_CATALOG.get("base_dir") or "LLM")
-    if not base_dir.is_dir():
-        return {}
-    catalog_filenames: set[str] = set()
-    for entry in (GGUF_VL_CATALOG.get("models") or {}).values():
-        fn = (entry or {}).get("filename")
-        if fn:
-            catalog_filenames.add(Path(fn).name)
-    found: dict[str, Path] = {}
-    for p in base_dir.rglob("*.gguf"):
-        if not p.is_file() or "mmproj" in p.name.lower():
-            continue
-        if p.name in catalog_filenames:
-            continue
-        try:
-            rel = p.relative_to(base_dir)
-        except ValueError:
-            rel = Path(p.name)
-        found[f"{LOCAL_PREFIX}{rel}"] = p
-    return found
+def refresh_local_gguf():
+    """Re-scan the base dirs. Called from INPUT_TYPES so new files show up on reload."""
+    global LOCAL_GGUF_MODELS, LOCAL_MMPROJ_FILES
+    base_dirs = model_scan.resolve_base_dirs(GGUF_BASE_DIRS)
+    LOCAL_GGUF_MODELS = model_scan.scan_gguf_files(base_dirs)
+    LOCAL_MMPROJ_FILES = model_scan.scan_mmproj_files(base_dirs)
 
 
-LOCAL_GGUF_FILES: dict[str, Path] = _scan_local_gguf_files()
+def list_model_names() -> list[str]:
+    refresh_local_gguf()
+    return list(LOCAL_GGUF_MODELS.keys())
+
+
+def list_mmproj_names() -> list[str]:
+    return [MMPROJ_AUTO] + list(LOCAL_MMPROJ_FILES.keys())
+
+
+refresh_local_gguf()
 
 
 def _filter_kwargs_for_callable(fn, kwargs: dict) -> dict:
@@ -300,136 +210,35 @@ def _pick_device(device_choice: str) -> str:
     return "cpu"
 
 
-def _download_single_file(repo_ids: list[str], filename: str, target_path: Path):
-    if target_path.exists():
-        print(f"[QwenVL] Using cached file: {target_path}")
-        return
+def _autodetect_mmproj(model_path: Path) -> Path | None:
+    """First *mmproj*.gguf next to the model (matches "mmproj-*.gguf" and "*.mmproj-*.gguf")."""
+    for candidate in sorted(model_path.parent.glob("*.gguf")):
+        if candidate.is_file() and model_scan.is_mmproj(candidate.name):
+            return candidate
+    return None
 
-    target_path.parent.mkdir(parents=True, exist_ok=True)
 
-    last_exc: Exception | None = None
-    for repo_id in repo_ids:
-        print(f"[QwenVL] Downloading {filename} from {repo_id} -> {target_path}")
-        try:
-            downloaded = hf_hub_download(
-                repo_id=repo_id,
-                filename=filename,
-                repo_type="model",
-                local_dir=str(target_path.parent),
-                local_dir_use_symlinks=False,
-            )
-            downloaded_path = Path(downloaded)
-            if downloaded_path.exists() and downloaded_path.resolve() != target_path.resolve():
-                downloaded_path.replace(target_path)
-            if target_path.exists():
-                print(f"[QwenVL] Download complete: {target_path}")
-            break
-        except Exception as exc:
-            last_exc = exc
-            print(f"[QwenVL] hf_hub_download failed from {repo_id}: {exc}")
+def _resolve_model_entry(model_name: str, mmproj_name: str = MMPROJ_AUTO) -> GGUFVLResolved:
+    base_dirs = model_scan.resolve_base_dirs(GGUF_BASE_DIRS)
+
+    model_path = model_scan.lookup(LOCAL_GGUF_MODELS, model_name)
+    if model_path is None or not model_path.is_file():
+        refresh_local_gguf()
+        model_path = model_scan.lookup(LOCAL_GGUF_MODELS, model_name)
+    if model_path is None or not model_path.is_file():
+        raise model_scan.missing_model_error(model_name, base_dirs, "GGUF model")
+
+    if mmproj_name and mmproj_name != MMPROJ_AUTO:
+        mmproj_path = model_scan.lookup(LOCAL_MMPROJ_FILES, mmproj_name)
+        if mmproj_path is None or not mmproj_path.is_file():
+            raise model_scan.missing_model_error(mmproj_name, base_dirs, "mmproj file")
     else:
-        raise FileNotFoundError(f"[QwenVL] Download failed for {filename}: {last_exc}")
-
-    if not target_path.exists():
-        raise FileNotFoundError(f"[QwenVL] File not found after download: {target_path}")
-
-
-_downloading_files: set[str] = set()
-_download_lock = threading.Lock()
-
-
-def _background_download(repo_ids: list[str], filename: str, target_path: Path):
-    try:
-        _download_single_file(repo_ids, filename, target_path)
-    except Exception as exc:
-        print(f"[QwenVL] Background download failed: {exc}")
-        print("[QwenVL] Download flag has been auto-cleared. Re-run to retry. / ダウンロードフラグは自動解除されました。再実行で再試行します。")
-        print("[QwenVL] Please check your network connection and available storage. / ネットワーク接続やストレージ空き容量を確認してください。")
-    finally:
-        with _download_lock:
-            _downloading_files.discard(str(target_path))
-
-
-def _resolve_model_entry(model_name: str) -> GGUFVLResolved:
-    # --- Local file ---
-    if model_name.startswith(LOCAL_PREFIX):
-        local_path = LOCAL_GGUF_FILES.get(model_name)
-        if local_path is None or not local_path.is_file():
-            raise FileNotFoundError(f"[QwenVL] Local GGUF not found: {model_name}")
-        # Auto-detect mmproj in the same directory (matches both "mmproj-*.gguf" and "*.mmproj-*.gguf")
-        mmproj = None
-        for candidate in sorted(local_path.parent.glob("*mmproj*.gguf")):
-            if candidate.is_file():
-                mmproj = candidate.name
-                break
-        return GGUFVLResolved(
-            display_name=model_name,
-            repo_id=None,
-            alt_repo_ids=[],
-            author=None,
-            repo_dirname=local_path.parent.name,
-            model_filename=local_path.name,
-            mmproj_filename=mmproj,
-            context_length=8192,
-            image_max_tokens=8192,
-            image_min_tokens=1024,
-            n_batch=8192,
-            gpu_layers=-1,
-            top_k=0,
-            pool_size=4194304,
-        )
-
-    # --- Catalog lookup ---
-    all_models = GGUF_VL_CATALOG.get("models") or {}
-    entry = all_models.get(model_name) or {}
-    if not entry:
-        wanted = _model_name_to_filename_candidates(model_name)
-        for candidate in all_models.values():
-            filename = candidate.get("filename")
-            if filename and Path(filename).name in wanted:
-                entry = candidate
-                break
-
-    # --- Fallback: try as local file if not found in catalog ---
-    if not entry or not entry.get("filename"):
-        local_key = f"{LOCAL_PREFIX}{model_name}"
-        if local_key in LOCAL_GGUF_FILES:
-            return _resolve_model_entry(local_key)
-
-    repo_id = entry.get("repo_id")
-    alt_repo_ids = entry.get("alt_repo_ids") or []
-
-    author = entry.get("author") or entry.get("publisher")
-    repo_dirname = entry.get("repo_dirname") or (repo_id.split("/")[-1] if isinstance(repo_id, str) and "/" in repo_id else model_name)
-
-    model_filename = entry.get("filename")
-    mmproj_filename = entry.get("mmproj_filename")
-
-    if not model_filename:
-        raise ValueError(f"[QwenVL] gguf_vl_models.json entry missing 'filename' for: {model_name}")
-
-    def _int(name: str, default: int) -> int:
-        value = entry.get(name, default)
-        try:
-            return int(value)
-        except Exception:
-            return default
+        mmproj_path = _autodetect_mmproj(model_path)
 
     return GGUFVLResolved(
         display_name=model_name,
-        repo_id=repo_id,
-        alt_repo_ids=[str(x) for x in alt_repo_ids if x],
-        author=str(author) if author else None,
-        repo_dirname=_safe_dirname(str(repo_dirname)),
-        model_filename=str(model_filename),
-        mmproj_filename=str(mmproj_filename) if mmproj_filename else None,
-        context_length=_int("context_length", 8192),
-        image_max_tokens=_int("image_max_tokens", 8192),
-        image_min_tokens=_int("image_min_tokens", 1024),
-        n_batch=_int("n_batch", 8192),
-        gpu_layers=_int("gpu_layers", -1),
-        top_k=_int("top_k", 0),
-        pool_size=_int("pool_size", 4194304),
+        model_path=model_path,
+        mmproj_path=mmproj_path,
     )
 
 
@@ -469,73 +278,13 @@ class QwenVLGGUFBase:
         top_k: int | None,
         pool_size: int | None,
         enable_thinking: bool = False,
+        mmproj_name: str = MMPROJ_AUTO,
     ):
         self._load_backend()
 
-        resolved = _resolve_model_entry(model_name)
-
-        if resolved.repo_id is None:
-            # Local file: path comes directly from scan results
-            local_key = model_name if model_name.startswith(LOCAL_PREFIX) else f"{LOCAL_PREFIX}{model_name}"
-            local_path = LOCAL_GGUF_FILES.get(local_key)
-            if local_path is None or not local_path.is_file():
-                raise FileNotFoundError(f"[QwenVL] Local GGUF not found: {model_name}")
-            model_path = local_path
-            mmproj_path = local_path.parent / resolved.mmproj_filename if resolved.mmproj_filename else None
-            if mmproj_path is not None and not mmproj_path.is_file():
-                print(f"[QwenVL] Warning: auto-detected mmproj not found: {mmproj_path}")
-                mmproj_path = None
-        else:
-            # Catalog model: resolve paths and download if needed
-            base_dir = _resolve_base_dir(GGUF_VL_CATALOG.get("base_dir") or "LLM")
-            author_dir = _safe_dirname(resolved.author or "")
-            repo_dir = _safe_dirname(resolved.repo_dirname)
-            target_dir = base_dir / author_dir / repo_dir
-
-            model_path = target_dir / Path(resolved.model_filename).name
-            mmproj_path = target_dir / Path(resolved.mmproj_filename).name if resolved.mmproj_filename else None
-
-            repo_ids: list[str] = []
-            if resolved.repo_id:
-                repo_ids.append(resolved.repo_id)
-            repo_ids.extend(resolved.alt_repo_ids)
-
-            needs_download = []
-            if not model_path.exists():
-                if not repo_ids:
-                    raise FileNotFoundError(f"[QwenVL] GGUF model not found locally and no repo_id provided: {model_path}")
-                needs_download.append((repo_ids, resolved.model_filename, model_path))
-            if mmproj_path is not None and not mmproj_path.exists():
-                if not repo_ids:
-                    raise FileNotFoundError(f"[QwenVL] mmproj not found locally and no repo_id provided: {mmproj_path}")
-                needs_download.append((repo_ids, resolved.mmproj_filename, mmproj_path))
-
-            if needs_download:
-                started = []
-                with _download_lock:
-                    for repos, filename, path in needs_download:
-                        key = str(path)
-                        if key not in _downloading_files:
-                            _downloading_files.add(key)
-                            started.append((repos, filename, path))
-
-                for repos, filename, path in started:
-                    t = threading.Thread(target=_background_download, args=(repos, filename, path), daemon=True)
-                    t.start()
-
-                all_files = ", ".join(f for _, f, _ in needs_download)
-                if started:
-                    raise RuntimeError(
-                        f"[QwenVL] Model download started / モデルのダウンロードを開始しました: {all_files}\n"
-                        "Please re-run after download completes. Check console for progress.\n"
-                        "ダウンロード完了後に再実行してください。進捗はコンソールで確認できます。"
-                    )
-                else:
-                    raise RuntimeError(
-                        f"[QwenVL] Model is downloading / モデルをダウンロード中です: {all_files}\n"
-                        "Please re-run after download completes. Check console for progress.\n"
-                        "ダウンロード完了後に再実行してください。進捗はコンソールで確認できます。"
-                    )
+        resolved = _resolve_model_entry(model_name, mmproj_name)
+        model_path = resolved.model_path
+        mmproj_path = resolved.mmproj_path
 
         device_kind = _pick_device(device)
 
@@ -739,6 +488,7 @@ class QwenVLGGUFBase:
         stop_words: list[str] | None = None,
         image2=None,
         image3=None,
+        mmproj_name: str = MMPROJ_AUTO,
     ):
         torch.manual_seed(int(seed))
 
@@ -791,6 +541,7 @@ class QwenVLGGUFBase:
                 top_k=top_k,
                 pool_size=pool_size,
                 enable_thinking=enable_thinking,
+                mmproj_name=mmproj_name,
             )
             if images_b64 and self.chat_handler is None:
                 print("[QwenVL] Warning: images provided but this model entry has no mmproj_file; images will be ignored")
@@ -814,10 +565,7 @@ class QwenVLGGUFBase:
 class AILab_QwenVL_GGUF(QwenVLGGUFBase):
     @classmethod
     def INPUT_TYPES(cls):
-        all_models = GGUF_VL_CATALOG.get("models") or {}
-        model_keys = sorted([key for key, entry in all_models.items() if (entry or {}).get("mmproj_filename")])
-        local_keys = sorted(LOCAL_GGUF_FILES.keys())
-        model_keys = (model_keys + local_keys) or ["(edit gguf_models.json)"]
+        model_keys = model_scan.dropdown(list_model_names())
         default_model = model_keys[0]
 
         prompts = PRESET_PROMPTS or ["🖼️ Detailed Description"]
@@ -826,7 +574,7 @@ class AILab_QwenVL_GGUF(QwenVLGGUFBase):
 
         return {
             "required": {
-                "model_name": (model_keys, {"default": default_model}),
+                "model_name": (model_keys, {"default": default_model, "tooltip": TOOLTIPS["model_name"]}),
                 "preset_prompt": (prompts, {"default": default_prompt}),
                 "custom_prompt": ("STRING", {"default": "", "multiline": True}),
                 "max_tokens": ("INT", {"default": 512, "min": 64, "max": 32768}),
@@ -885,11 +633,9 @@ class AILab_QwenVL_GGUF(QwenVLGGUFBase):
 class AILab_QwenVL_GGUF_Advanced(QwenVLGGUFBase):
     @classmethod
     def INPUT_TYPES(cls):
-        all_models = GGUF_VL_CATALOG.get("models") or {}
-        model_keys = sorted([key for key, entry in all_models.items() if (entry or {}).get("mmproj_filename")])
-        local_keys = sorted(LOCAL_GGUF_FILES.keys())
-        model_keys = (model_keys + local_keys) or ["(edit gguf_models.json)"]
+        model_keys = model_scan.dropdown(list_model_names())
         default_model = model_keys[0]
+        mmproj_keys = list_mmproj_names()
 
         prompts = PRESET_PROMPTS or ["🖼️ Detailed Description"]
         preferred_prompt = "🖼️ Detailed Description"
@@ -901,7 +647,8 @@ class AILab_QwenVL_GGUF_Advanced(QwenVLGGUFBase):
 
         return {
             "required": {
-                "model_name": (model_keys, {"default": default_model}),
+                "model_name": (model_keys, {"default": default_model, "tooltip": TOOLTIPS["model_name"]}),
+                "mmproj_name": (mmproj_keys, {"default": MMPROJ_AUTO, "tooltip": TOOLTIPS["mmproj_name"]}),
                 "device": (device_options, {"default": "auto"}),
                 "preset_prompt": (prompts, {"default": default_prompt}),
                 "custom_prompt": ("STRING", {"default": "", "multiline": True}),
@@ -938,6 +685,7 @@ class AILab_QwenVL_GGUF_Advanced(QwenVLGGUFBase):
     def process(
         self,
         model_name,
+        mmproj_name,
         device,
         preset_prompt,
         custom_prompt,
@@ -988,6 +736,7 @@ class AILab_QwenVL_GGUF_Advanced(QwenVLGGUFBase):
             stop_words=parsed,
             image2=image2,
             image3=image3,
+            mmproj_name=mmproj_name,
         )
 
 

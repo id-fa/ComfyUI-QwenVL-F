@@ -1,3 +1,28 @@
+# **QwenVL for ComfyUI（分支版）**
+
+这是 [1038lab/ComfyUI-QwenVL](https://github.com/1038lab/ComfyUI-QwenVL) 的一个分支，包含以下新增内容：
+
+## **分支变更**
+
+- **仅本地模型发现（不再自动下载）**: 已从全部六个节点中移除所有下载逻辑 —— 不再有 `snapshot_download`、`hf_hub_download` 或后台下载线程。模型下拉列表完全通过扫描本地磁盘生成，因此需要您自行放置模型并重新加载 ComfyUI。若模型缺失，节点会抛出错误并列出所查找的目录，而不是启动下载。
+  - **扫描目录**: 默认为 `ComfyUI/models/text_encoders` 和 `ComfyUI/models/LLM`，均递归扫描（包含子目录）。可通过 `hf_models.json` / `gguf_models.json` 中的 `base_dirs` 配置；每个条目可以是 `folder_paths` 键（因此会应用 `extra_model_paths.yaml` 中的路径 —— `text_encoders` 是 ComfyUI 自带的键）、`ComfyUI/models` 下的子目录名，或绝对路径。按顺序扫描，名称冲突时以靠前的目录为准。
+  - **列出的内容**: HF 检查点指同时包含 `config.json` 与权重分片的目录 —— QwenVL 节点仅列出视觉检查点（根据 `config.json` 判定），而提示词增强器列出全部检查点并自动选择纯文本或 VL 代码路径。GGUF 节点按相对于其根目录的路径列出所有 `.gguf`。
+  - **向后兼容**: 旧工作流中保存的模型名称（包括 `[local] relative/path` 形式）仍可解析。
+  - `hf_models.json` / `gguf_models.json` 中的模型条目不再被读取，仅作为手动下载来源的参考列表保留。
+- **显式选择 mmproj**: GGUF Advanced 节点新增 `mmproj_name` 控件，列出磁盘上找到的所有 `*mmproj*.gguf`。默认值 `auto` 保持原有行为，即自动选择与所选模型位于同一目录的投影器。
+- **GGUF 提示词增强器的上下文长度控制**: 新增 `ctx` 控件（默认 8192），取代原先来自目录配置的上下文长度。
+- **多图参考支持**: Advanced 节点（HF / GGUF）最多接受 3 个图像输入（`image`、`image2`、`image3`），可同时分析多张图像。
+- **思考模式开关**: 所有节点（Simple / Advanced，HF / GGUF）均带有 `enable_thinking` 开关。为 Qwen3-VL Thinking 模型启用 `<think>...</think>` 推理模式；默认关闭。
+- **Gemma 4 GGUF 支持**: GGUF 节点通过文件名自动识别 Gemma 模型并切换到 `Gemma4ChatHandler`，跳过 Qwen 专用的 `/think` 前缀注入和 MROPE 图像缩放保护，并从输出中移除 Gemma 的 `<|channel|>` 推理标记。需要 [JamePeng 的 llama-cpp-python v0.3.35+ 分支](https://github.com/JamePeng/llama-cpp-python/discussions/109)。Qwen 模型的行为保持不变。
+
+![QwenVL-F_GGUF_Advanced](example_workflows/mod1_adv.png)
+
+---
+
+*以下是上游仓库的原始 README。*
+
+---
+
 # **QwenVL for ComfyUI**
 
 ComfyUI-QwenVL 是一款自定义节点，它集成了来自阿里云的强大 Qwen-VL 系列视觉语言模型（LVLMs），包括最新的 Qwen3-VL 和 Qwen2.5-VL。这款高级节点能够在您的 ComfyUI 工作流中实现无缝的多模态 AI 功能，支持高效的文本生成、图像理解和视频分析。

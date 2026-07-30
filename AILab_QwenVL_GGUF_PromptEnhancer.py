@@ -3,7 +3,9 @@
 # GGUF nodes powered by llama.cpp for Qwen-VL models, including Qwen3-VL and Qwen2.5-VL.
 # Provides vision-capable GGUF inference and prompt execution.
 #
-# Models are loaded via llama-cpp-python and configured through gguf_models.json.
+# Models are loaded via llama-cpp-python from .gguf files already present under
+# the configured base dirs (models/text_encoders and models/LLM by default);
+# nothing is downloaded automatically.
 # This integration script follows GPL-3.0 License.
 # When using or modifying this code, please respect both the original model licenses
 # and this integration's license terms.
@@ -17,11 +19,10 @@ import re
 from pathlib import Path
 
 import torch
-from huggingface_hub import hf_hub_download, snapshot_download
 from llama_cpp import Llama
 
-import folder_paths
 from AILab_OutputCleaner import OutputCleanConfig, clean_model_output
+import AILab_ModelScan as model_scan
 
 NODE_DIR = Path(__file__).parent
 GGUF_CONFIG_PATH = NODE_DIR / "gguf_models.json"
@@ -48,71 +49,24 @@ PROMPT_CONFIG = load_prompt_config()
 STYLES = PROMPT_CONFIG.get("styles", {})
 
 
-def _safe_dirname(value: str) -> str:
-    value = (value or "").strip()
-    if not value:
-        return "unknown"
-    return "".join(ch for ch in value if ch.isalnum() or ch in "._- ").strip() or "unknown"
-
-
-def _resolve_base_dir(base_dir_value: str) -> Path:
-    base_dir = Path(base_dir_value)
-    if base_dir.is_absolute():
-        return base_dir
-    # Check extra_model_paths.yaml via folder_paths
-    folder_key = base_dir.parts[0] if base_dir.parts else base_dir_value
-    sub_path = Path(*base_dir.parts[1:]) if len(base_dir.parts) > 1 else Path()
-    if folder_key in folder_paths.folder_names_and_paths:
-        paths = folder_paths.get_folder_paths(folder_key)
-        if paths:
-            return Path(paths[0]) / sub_path
-    return Path(folder_paths.models_dir) / base_dir
-
-
-def _model_name_to_filename_candidates(model_name: str) -> set[str]:
-    raw = (model_name or "").strip()
-    if not raw:
-        return set()
-    candidates = {raw, f"{raw}.gguf"}
-    if " / " in raw:
-        tail = raw.split(" / ", 1)[1].strip()
-        candidates.update({tail, f"{tail}.gguf"})
-    if "/" in raw:
-        tail = raw.rsplit("/", 1)[-1].strip()
-        candidates.update({tail, f"{tail}.gguf"})
-    return candidates
-
-
-LOCAL_PREFIX = "[local] "
+GGUF_BASE_DIRS: list[str] = model_scan.read_base_dirs(GGUF_CONFIG_PATH)
+LOCAL_GGUF_MODELS: dict[str, Path] = {}
 
 
 def _is_gemma_model_name(name: str) -> bool:
-    """Detect Gemma models by filename substring (covers catalog keys and [local] paths)."""
+    """Detect Gemma models by filename substring (covers relative paths)."""
     return "gemma" in (name or "").lower()
 
 
-def _scan_local_gguf_files(catalog: dict) -> dict[str, Path]:
-    """Scan base_dir for .gguf files not already in the given catalog."""
-    base_dir = _resolve_base_dir(catalog.get("base_dir") or "LLM")
-    if not base_dir.is_dir():
-        return {}
-    catalog_filenames: set[str] = set()
-    for entry in (catalog.get("models") or {}).values():
-        fn = (entry or {}).get("filename")
-        if fn:
-            catalog_filenames.add(Path(fn).name)
-    found: dict[str, Path] = {}
-    for p in base_dir.rglob("*.gguf"):
-        if not p.is_file() or "mmproj" in p.name.lower():
-            continue
-        if p.name in catalog_filenames:
-            continue
-        try:
-            rel = p.relative_to(base_dir)
-        except ValueError:
-            rel = Path(p.name)
-        found[f"{LOCAL_PREFIX}{rel}"] = p
-    return found
+def refresh_local_gguf() -> dict[str, Path]:
+    """Re-scan the base dirs. Called from INPUT_TYPES so new files show up on reload."""
+    global LOCAL_GGUF_MODELS
+    LOCAL_GGUF_MODELS = model_scan.scan_gguf_files(model_scan.resolve_base_dirs(GGUF_BASE_DIRS))
+    return LOCAL_GGUF_MODELS
+
+
+def list_model_names() -> list[str]:
+    return list(refresh_local_gguf().keys())
 
 
 class AILab_QwenVL_GGUF_PromptEnhancer:
@@ -124,82 +78,18 @@ class AILab_QwenVL_GGUF_PromptEnhancer:
     def __init__(self):
         self.llm = None
         self.current_signature = None
-        self.gguf_models = self.load_gguf_models()
         self.styles = STYLES
-
-    @staticmethod
-    def load_gguf_models():
-        fallback = {
-            "base_dir": "LLM",
-            "models": {},
-        }
-        if not GGUF_CONFIG_PATH.exists():
-            return fallback
-        try:
-            with open(GGUF_CONFIG_PATH, "r", encoding="utf-8") as fh:
-                data = json.load(fh) or {}
-        except Exception as exc:
-            print(f"[QwenVL] gguf_models.json load failed: {exc}")
-            return fallback
-
-        base_dir = data.get("base_dir") or fallback["base_dir"]
-
-        models: dict[str, dict] = {}
-
-        # Legacy/custom direct entries (optional)
-        legacy_models = data.get("models") or {}
-        if isinstance(legacy_models, dict):
-            for name, entry in legacy_models.items():
-                if isinstance(entry, dict):
-                    models[name] = entry
-
-        # Text-only catalog (use Qwen_model; do not use qwenVL_model here)
-        qwen_repos = data.get("Qwen_model") or {}
-        if isinstance(qwen_repos, dict):
-            seen_display_names: set[str] = set()
-            for repo_key, repo in qwen_repos.items():
-                if not isinstance(repo, dict):
-                    continue
-                author = repo.get("author") or repo.get("publisher")
-                repo_name = repo.get("repo_name") or repo.get("repo_name_override") or repo_key
-                defaults = repo.get("defaults") if isinstance(repo.get("defaults"), dict) else {}
-                repo_id = repo.get("repo_id")
-                alt_repo_ids = repo.get("alt_repo_ids") or []
-                model_files = repo.get("model_files") or []
-                for model_file in model_files:
-                    # Prefer short names in UI: just the filename.
-                    display = Path(model_file).name
-                    if display in seen_display_names:
-                        display = f"{display} ({repo_key})"
-                    seen_display_names.add(display)
-                    entry = dict(defaults)
-                    entry.update(
-                        {
-                            "author": author,
-                            "repo_dirname": repo_name,
-                            "repo_id": repo_id,
-                            "alt_repo_ids": alt_repo_ids,
-                            "filename": model_file,
-                        }
-                    )
-                    models[display] = entry
-
-        return {"base_dir": base_dir, "models": models}
 
     @classmethod
     def INPUT_TYPES(cls):
         styles = list(STYLES.keys())
         preferred_style = "📝 Enhance"
         default_style = preferred_style if preferred_style in styles else (styles[0] if styles else "📝 Enhance")
-        temp = cls.load_gguf_models()
-        model_keys = sorted(list((temp.get("models") or {}).keys()))
-        local_files = _scan_local_gguf_files(temp)
-        local_keys = sorted(local_files.keys())
-        model_keys = (model_keys + local_keys) or ["(edit gguf_models.json)"]
+        model_keys = model_scan.dropdown(list_model_names())
         default_model = model_keys[0]
         return {
             "required": {
-                "model_name": (model_keys, {"default": default_model, "tooltip": "GGUF model entry defined in gguf_models.json."}),
+                "model_name": (model_keys, {"default": default_model, "tooltip": "Pick a .gguf already present under models/text_encoders or models/LLM. Nothing is downloaded automatically — copy the file in yourself, then reload ComfyUI."}),
                 "prompt_text": ("STRING", {"default": "", "multiline": True, "tooltip": "Prompt text to enhance. Leave blank to just emit the preset instruction."}),
                 "preset_system_prompt": (styles, {"default": default_style}),
                 "custom_system_prompt": ("STRING", {"default": "", "multiline": True}),
@@ -207,6 +97,7 @@ class AILab_QwenVL_GGUF_PromptEnhancer:
                 "temperature": ("FLOAT", {"default": 0.7, "min": 0.1, "max": 1.0}),
                 "top_p": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 1.0}),
                 "repetition_penalty": ("FLOAT", {"default": 1.1, "min": 0.5, "max": 2.0}),
+                "ctx": ("INT", {"default": 8192, "min": 1024, "max": 262144, "step": 512, "tooltip": "Context length passed to llama.cpp."}),
                 "english_output": ("BOOLEAN", {"default": False, "tooltip": "Force final output in English using translation prompt."}),
                 "device": (["auto", "cuda", "cpu", "mps"], {"default": "auto", "tooltip": "Select device; auto prefers GPU when available."}),
                 "keep_model_loaded": ("BOOLEAN", {"default": True, "tooltip": "Keep the model in memory after execution. Disable to free VRAM."}),
@@ -221,123 +112,23 @@ class AILab_QwenVL_GGUF_PromptEnhancer:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    def _resolve_model_path(self, model_name):
-        if model_name.startswith(LOCAL_PREFIX):
-            local_files = _scan_local_gguf_files(self.gguf_models)
-            local_path = local_files.get(model_name)
-            if local_path is not None and local_path.is_file():
-                return local_path
-            raise FileNotFoundError(f"[QwenVL] Local GGUF not found: {model_name}")
+    def _resolve_model_path(self, model_name) -> Path:
+        resolved = model_scan.lookup(LOCAL_GGUF_MODELS, model_name)
+        if resolved is None or not resolved.is_file():
+            resolved = model_scan.lookup(refresh_local_gguf(), model_name)
+        if resolved is None or not resolved.is_file():
+            raise model_scan.missing_model_error(
+                model_name, model_scan.resolve_base_dirs(GGUF_BASE_DIRS), "GGUF model"
+            )
+        return resolved
 
-        models = self.gguf_models.get("models") or {}
-        entry = models.get(model_name) or {}
-
-        # Back-compat: allow workflows to pass a filename instead of a catalog key.
-        if not entry:
-            wanted = _model_name_to_filename_candidates(model_name)
-            for candidate in models.values():
-                filename = candidate.get("filename")
-                if filename and Path(filename).name in wanted:
-                    entry = candidate
-                    break
-
-        # Fallback: try as local file if not found in catalog
-        if not entry or not entry.get("filename"):
-            local_key = f"{LOCAL_PREFIX}{model_name}"
-            local_files = _scan_local_gguf_files(self.gguf_models)
-            local_path = local_files.get(local_key)
-            if local_path is not None and local_path.is_file():
-                return local_path
-
-        base_dir = _resolve_base_dir(self.gguf_models.get("base_dir") or "LLM")
-
-        path = entry.get("path")
-        if path:
-            return Path(path).expanduser()
-
-        filename = entry.get("filename")
-        if filename:
-            author = _safe_dirname(str(entry.get("author") or entry.get("publisher") or ""))
-            repo_dir = _safe_dirname(str(entry.get("repo_dirname") or model_name))
-            if author and author != "unknown":
-                return base_dir / author / repo_dir / Path(filename).name
-            return base_dir / repo_dir / Path(filename).name
-
-        return base_dir / model_name
-
-    def _maybe_download_model(self, model_name, resolved):
-        if resolved.exists():
-            return
-        if model_name.startswith(LOCAL_PREFIX):
-            raise FileNotFoundError(f"[QwenVL] Local GGUF file not found: {resolved}")
-        models = self.gguf_models.get("models") or {}
-        entry = models.get(model_name) or {}
-        if not entry:
-            wanted = _model_name_to_filename_candidates(model_name)
-            for candidate in models.values():
-                filename = candidate.get("filename")
-                if filename and Path(filename).name in wanted:
-                    entry = candidate
-                    break
-
-        repo_ids = [rid for rid in (entry.get("alt_repo_ids") or []) + [entry.get("repo_id")] if rid]
-        filename = entry.get("filename") or resolved.name
-        if not repo_ids or not filename:
-            raise FileNotFoundError(f"[QwenVL] GGUF missing and no repo_id/filename to download: {resolved}")
-        target_dir = resolved.parent
-        target_dir.mkdir(parents=True, exist_ok=True)
-        attempted = []
-        for repo_id in repo_ids:
-            attempted.append(repo_id)
-            print(f"[QwenVL] Downloading GGUF {filename} from {repo_id}")
-            try:
-                downloaded = hf_hub_download(
-                    repo_id=repo_id,
-                    filename=filename,
-                    repo_type="model",
-                    local_dir=str(target_dir),
-                    local_dir_use_symlinks=False,
-                )
-                downloaded_path = Path(downloaded)
-                if downloaded_path.exists() and downloaded_path.resolve() != resolved.resolve():
-                    resolved.parent.mkdir(parents=True, exist_ok=True)
-                    downloaded_path.replace(resolved)
-            except Exception as exc:
-                print(f"[QwenVL] hf_hub_download failed from {repo_id}: {exc}")
-            if resolved.exists():
-                break
-            try:
-                snapshot_download(
-                    repo_id=repo_id,
-                    repo_type="model",
-                    local_dir=str(target_dir),
-                    local_dir_use_symlinks=False,
-                    allow_patterns=[filename, f"**/{filename}"],
-                )
-            except Exception as exc:
-                print(f"[QwenVL] Filtered snapshot failed from {repo_id}: {exc}")
-            if resolved.exists():
-                break
-            found = list(target_dir.rglob(filename))
-            if found:
-                resolved.parent.mkdir(parents=True, exist_ok=True)
-                found[0].replace(resolved)
-                break
-        if not resolved.exists():
-            raise FileNotFoundError(f"[QwenVL] GGUF model not found after download: {resolved} (tried: {', '.join(attempted)})")
-
-    def _load_model(self, model_name, device):
+    def _load_model(self, model_name, device, context_length):
         resolved = self._resolve_model_path(model_name)
-        self._maybe_download_model(model_name, resolved)
-        model_cfg = self.gguf_models["models"].get(model_name, {})
-        context_length = model_cfg.get("context_length", 8192)
+        context_length = int(context_length)
         signature = (resolved, context_length, device)
         if self.llm is not None and self.current_signature == signature:
             return
         self.clear()
-        resolved.parent.mkdir(parents=True, exist_ok=True)
-        if not resolved.exists():
-            raise FileNotFoundError(f"[QwenVL] GGUF model not found: {resolved}")
         print(f"[QwenVL] Loading GGUF model from {resolved}")
         if device == "auto":
             device_choice = "cuda" if torch.cuda.is_available() else ("mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available() else "cpu")
@@ -432,6 +223,7 @@ class AILab_QwenVL_GGUF_PromptEnhancer:
         temperature,
         top_p,
         repetition_penalty,
+        ctx,
         english_output,
         device,
         keep_model_loaded,
@@ -448,7 +240,7 @@ class AILab_QwenVL_GGUF_PromptEnhancer:
         )
         user_prompt = prompt_text.strip() or "Describe a scene vividly."
         merged_prompt = user_prompt
-        self._load_model(model_name, device)
+        self._load_model(model_name, device, ctx)
         enhanced = self._invoke_llama(
             system_prompt=system_prompt,
             user_prompt=merged_prompt,

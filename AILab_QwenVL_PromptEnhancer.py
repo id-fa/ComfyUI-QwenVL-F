@@ -11,13 +11,14 @@ from pathlib import Path
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
+import AILab_ModelScan as model_scan
 from AILab_QwenVL import (
     ATTENTION_MODES,
-    HF_TEXT_MODELS,
-    HF_VL_MODELS,
     QwenVLBase,
     Quantization,
     TOOLTIPS,
+    get_local_model,
+    list_all_model_names,
 )
 
 NODE_DIR = Path(__file__).parent
@@ -73,8 +74,8 @@ class AILab_QwenVL_PromptEnhancer(QwenVLBase):
 
     @classmethod
     def INPUT_TYPES(cls):
-        models = list(HF_TEXT_MODELS.keys()) + [name for name in HF_VL_MODELS.keys() if name not in HF_TEXT_MODELS]
-        default_model = models[0] if models else "Qwen3-VL-4B-Instruct"
+        models = model_scan.dropdown(list_all_model_names())
+        default_model = models[0]
         styles = list(cls.STYLES.keys())
         preferred_style = "📝 Enhance"
         default_style = preferred_style if preferred_style in styles else (styles[0] if styles else "📝 Enhance")
@@ -120,7 +121,8 @@ class AILab_QwenVL_PromptEnhancer(QwenVLBase):
         )
         user_prompt = prompt_text.strip() or "Describe a scene vividly."
         merged_prompt = f"{base_instruction}\n\n{user_prompt}".strip()
-        if model_name in HF_TEXT_MODELS:
+        # Text-only checkpoints go through AutoModelForCausalLM; VL ones reuse the QwenVL path.
+        if not get_local_model(model_name).is_vision:
             # Release VL model if previously loaded (path switch: QwenVL → text)
             if self.model is not None:
                 self.clear()
@@ -198,10 +200,7 @@ class AILab_QwenVL_PromptEnhancer(QwenVLBase):
         return output[0]
 
     def _load_text_model(self, model_name, quantization, device_choice):
-        info = HF_TEXT_MODELS.get(model_name, {})
-        repo_id = info.get("repo_id")
-        if not repo_id:
-            raise ValueError(f"[QwenVL] Missing repo_id for text model: {model_name}")
+        model_path = str(get_local_model(model_name).path)
 
         if device_choice == "auto":
             device = "cuda" if torch.cuda.is_available() else ("mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available() else "cpu")
@@ -220,7 +219,7 @@ class AILab_QwenVL_PromptEnhancer(QwenVLBase):
         else:
             quant_cfg = None
 
-        signature = (repo_id, quantization, device)
+        signature = (model_path, quantization, device)
         if self.text_model is not None and self.text_signature == signature:
             return
 
@@ -238,8 +237,8 @@ class AILab_QwenVL_PromptEnhancer(QwenVLBase):
             load_kwargs["torch_dtype"] = torch.float16 if device == "cuda" else torch.float32
 
         print(f"[QwenVL] Loading text model {model_name} ({quantization})")
-        self.text_tokenizer = AutoTokenizer.from_pretrained(repo_id, trust_remote_code=True)
-        self.text_model = AutoModelForCausalLM.from_pretrained(repo_id, trust_remote_code=True, **load_kwargs).eval()
+        self.text_tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        self.text_model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True, **load_kwargs).eval()
         self.text_model.to(device)
         self.text_signature = signature
 

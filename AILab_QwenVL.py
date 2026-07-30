@@ -17,7 +17,6 @@ import gc
 import json
 import os
 import platform
-import threading
 from enum import Enum
 from pathlib import Path
 
@@ -25,16 +24,15 @@ import numpy as np
 import psutil
 import torch
 from PIL import Image
-from huggingface_hub import snapshot_download
 try:
     from transformers import AutoModelForImageTextToText as AutoModelForVision2Seq
 except ImportError:
     from transformers import AutoModelForVision2Seq
 from transformers import AutoProcessor, AutoTokenizer, BitsAndBytesConfig
 
-import folder_paths
 from comfy.utils import ProgressBar
 from AILab_OutputCleaner import clean_model_output, OutputCleanConfig
+import AILab_ModelScan as model_scan
 
 # SageAttention support
 try:
@@ -50,15 +48,13 @@ except ImportError:
 NODE_DIR = Path(__file__).parent
 CONFIG_PATH = NODE_DIR / "hf_models.json"
 SYSTEM_PROMPTS_PATH = NODE_DIR / "AILab_System_Prompts.json"
-HF_VL_MODELS: dict[str, dict] = {}
-HF_TEXT_MODELS: dict[str, dict] = {}
-HF_ALL_MODELS: dict[str, dict] = {}
-HF_BASE_DIR: str = "LLM"
+HF_BASE_DIRS: list[str] = list(model_scan.DEFAULT_BASE_DIRS)
+LOCAL_HF_MODELS: dict[str, model_scan.HFLocalModel] = {}
 SYSTEM_PROMPTS = {}
 PRESET_PROMPTS: list[str] = ["Describe this image in detail."]
 
 TOOLTIPS = {
-    "model_name": "Pick the Qwen-VL checkpoint. First run downloads weights into models/LLM/Qwen-VL, so leave disk space.",
+    "model_name": "Pick a Transformers checkpoint already present under models/text_encoders or models/LLM. Nothing is downloaded automatically — copy the model folder in yourself, then reload ComfyUI.",
     "quantization": "Precision vs VRAM. FP16 gives the best quality if memory allows; 8-bit suits 8–16 GB GPUs; 4-bit fits 6 GB or lower but is slower.",
     "attention_mode": "auto tries flash-attn v2 when installed and falls back to SDPA. Only override when debugging attention backends.",
     "preset_prompt": "Built-in instruction describing how Qwen-VL should analyze the media input.",
@@ -96,24 +92,16 @@ class Quantization(str, Enum):
 ATTENTION_MODES = ["auto", "sage", "flash_attention_2", "sdpa"]
 
 def load_model_configs():
-    global HF_VL_MODELS, HF_TEXT_MODELS, HF_ALL_MODELS, HF_BASE_DIR, SYSTEM_PROMPTS, PRESET_PROMPTS
+    """Load prompt presets and the base dirs. Model entries come from disk, not json."""
+    global HF_BASE_DIRS, SYSTEM_PROMPTS, PRESET_PROMPTS
+    HF_BASE_DIRS = model_scan.read_base_dirs(CONFIG_PATH)
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
             data = json.load(fh) or {}
-        HF_BASE_DIR = data.get("base_dir") or "LLM"
-        if "hf_vl_models" in data or "hf_text_models" in data:
-            HF_VL_MODELS = data.get("hf_vl_models") or {}
-            HF_TEXT_MODELS = data.get("hf_text_models") or {}
-        else:
-            HF_VL_MODELS = {k: v for k, v in data.items() if not k.startswith("_")}
-            HF_TEXT_MODELS = {}
         SYSTEM_PROMPTS = data.get("_system_prompts", {})
         PRESET_PROMPTS = data.get("_preset_prompts", PRESET_PROMPTS)
     except Exception as exc:
         print(f"[QwenVL] Config load failed: {exc}")
-        HF_VL_MODELS = {}
-        HF_TEXT_MODELS = {}
-        HF_ALL_MODELS = {}
         SYSTEM_PROMPTS = {}
     try:
         with open(SYSTEM_PROMPTS_PATH, "r", encoding="utf-8") as fh:
@@ -128,30 +116,8 @@ def load_model_configs():
         pass
     except Exception as exc:
         print(f"[QwenVL] System prompts load failed: {exc}")
-    custom = NODE_DIR / "custom_models.json"
-    if custom.exists():
-        try:
-            with open(custom, "r", encoding="utf-8") as fh:
-                data = json.load(fh) or {}
-            custom_vl = data.get("hf_vl_models") or {}
-            custom_text = data.get("hf_text_models") or {}
-            legacy = data.get("hf_models", {}) or data.get("models", {})
-            if isinstance(custom_vl, dict) and custom_vl:
-                HF_VL_MODELS.update(custom_vl)
-                print(f"[QwenVL] Loaded {len(custom_vl)} custom VL models")
-            if isinstance(custom_text, dict) and custom_text:
-                HF_TEXT_MODELS.update(custom_text)
-                print(f"[QwenVL] Loaded {len(custom_text)} custom text models")
-            if isinstance(legacy, dict) and legacy:
-                HF_VL_MODELS.update(legacy)
-                print(f"[QwenVL] Loaded {len(legacy)} custom legacy models")
-        except Exception as exc:
-            print(f"[QwenVL] custom_models.json skipped: {exc}")
-    HF_ALL_MODELS = dict(HF_VL_MODELS)
-    HF_ALL_MODELS.update(HF_TEXT_MODELS)
 
-if not HF_ALL_MODELS:
-    load_model_configs()
+load_model_configs()
 
 def get_device_info():
     gpu = {"available": False, "total_memory": 0, "free_memory": 0}
@@ -457,81 +423,38 @@ def set_sage_attention(model):
     else:
         print("[QwenVL] SageAttention: No compatible attention layers found to patch")
 
-def _resolve_hf_base_dir() -> Path:
-    base_dir = Path(HF_BASE_DIR)
-    if base_dir.is_absolute():
-        return base_dir
-    # Check extra_model_paths.yaml via folder_paths
-    folder_key = base_dir.parts[0] if base_dir.parts else "LLM"
-    sub_path = Path(*base_dir.parts[1:]) if len(base_dir.parts) > 1 else Path()
-    if folder_key in folder_paths.folder_names_and_paths:
-        paths = folder_paths.get_folder_paths(folder_key)
-        if paths:
-            return Path(paths[0]) / sub_path
-    return Path(folder_paths.models_dir) / base_dir
+def _resolve_hf_base_dirs() -> list[Path]:
+    return model_scan.resolve_base_dirs(HF_BASE_DIRS)
 
-_downloading_files: set[str] = set()
-_download_lock = threading.Lock()
+def refresh_local_models() -> dict[str, model_scan.HFLocalModel]:
+    """Re-scan the base dirs. Called from INPUT_TYPES so new folders show up on reload."""
+    global LOCAL_HF_MODELS
+    LOCAL_HF_MODELS = model_scan.scan_hf_models(_resolve_hf_base_dirs())
+    return LOCAL_HF_MODELS
 
-def ensure_model(model_name):
-    info = HF_ALL_MODELS.get(model_name)
-    if not info:
-        raise ValueError(f"Model '{model_name}' not in config")
-    repo_id = info["repo_id"]
+def list_vl_model_names() -> list[str]:
+    return [name for name, entry in refresh_local_models().items() if entry.is_vision]
 
-    models_dir = _resolve_hf_base_dir()
+def list_all_model_names() -> list[str]:
+    return list(refresh_local_models().keys())
 
-    models_dir.mkdir(parents=True, exist_ok=True)
-    target = models_dir / repo_id.split("/")[-1]
-
-    # If already downloaded (has weights), use local without calling snapshot_download
-    if target.exists() and target.is_dir():
-        if any(target.glob("*.safetensors")) or any(target.glob("*.bin")):
-            return str(target)
-
-    # Download needed — start in background and notify user
-    key = str(target)
-    with _download_lock:
-        already_downloading = key in _downloading_files
-        if not already_downloading:
-            _downloading_files.add(key)
-
-    if not already_downloading:
-        def _bg():
-            try:
-                snapshot_download(
-                    repo_id=repo_id,
-                    local_dir=str(target),
-                    local_dir_use_symlinks=False,
-                    ignore_patterns=["*.md", ".git*"],
-                )
-            except Exception as exc:
-                print(f"[QwenVL] Background download failed: {exc}")
-                print("[QwenVL] Download flag has been auto-cleared. Re-run to retry. / ダウンロードフラグは自動解除されました。再実行で再試行します。")
-                print("[QwenVL] Please check your network connection and available storage. / ネットワーク接続やストレージ空き容量を確認してください。")
-            finally:
-                with _download_lock:
-                    _downloading_files.discard(key)
-        threading.Thread(target=_bg, daemon=True).start()
-        raise RuntimeError(
-            f"[QwenVL] Model download started / モデルのダウンロードを開始しました: {repo_id}\n"
-            "Please re-run after download completes. Check console for progress.\n"
-            "ダウンロード完了後に再実行してください。進捗はコンソールで確認できます。"
-        )
-    else:
-        raise RuntimeError(
-            f"[QwenVL] Model is downloading / モデルをダウンロード中です: {repo_id}\n"
-            "Please re-run after download completes. Check console for progress.\n"
-            "ダウンロード完了後に再実行してください。進捗はコンソールで確認できます。"
-        )
+def get_local_model(model_name) -> model_scan.HFLocalModel:
+    entry = model_scan.lookup(LOCAL_HF_MODELS, model_name)
+    if entry is None:
+        entry = model_scan.lookup(refresh_local_models(), model_name)
+    if entry is None:
+        raise model_scan.missing_model_error(model_name, _resolve_hf_base_dirs(), "Transformers checkpoint")
+    return entry
 
 def enforce_memory(model_name, quantization, device_info):
-    info = HF_ALL_MODELS.get(model_name, {})
-    requirements = info.get("vram_requirement", {})
+    # Weight files on disk are the only size hint we have; treat them as the FP16
+    # footprint and halve/quarter it for the BitsAndBytes modes.
+    entry = model_scan.lookup(LOCAL_HF_MODELS, model_name)
+    full = entry.weight_gib if entry else 0.0
     mapping = {
-        Quantization.Q4: requirements.get("4bit", 0),
-        Quantization.Q8: requirements.get("8bit", 0),
-        Quantization.FP16: requirements.get("full", 0),
+        Quantization.Q4: full / 4,
+        Quantization.Q8: full / 2,
+        Quantization.FP16: full,
     }
     needed = mapping.get(quantization, 0)
     if not needed:
@@ -551,21 +474,22 @@ def enforce_memory(model_name, quantization, device_info):
         raise RuntimeError("Insufficient memory for 4-bit mode")
     return quantization
 
-def is_fp8_model(model_name: str) -> bool:
-    """Check if model name indicates it's a pre-quantized FP8 model."""
-    fp8_indicators = ["-fp8", "_fp8", "-FP8", "_FP8"]
-    return any(indicator in model_name for indicator in fp8_indicators)
+def is_prequantized_model(model_name: str) -> bool:
+    """Pre-quantized checkpoint (FP8 etc.), detected from config.json or the folder name."""
+    entry = model_scan.lookup(LOCAL_HF_MODELS, model_name)
+    if entry is not None:
+        return entry.is_prequantized
+    return any(indicator in model_name.lower() for indicator in ("-fp8", "_fp8"))
 
 
 def quantization_config(model_name, quantization):
     """Returns (quant_config, dtype, is_prequantized_fp8).
-    
+
     For pre-quantized FP8 models, we need special handling:
     - Don't use device_map (load directly to device)
     - Don't use flash_attention_2 (only supports fp16/bf16)
     """
-    info = HF_ALL_MODELS.get(model_name, {})
-    if info.get("quantized") or is_fp8_model(model_name):
+    if is_prequantized_model(model_name):
         # Pre-quantized model (FP8, etc.)
         return None, None, True
     if quantization == Quantization.Q4:
@@ -625,7 +549,7 @@ class QwenVLBase:
         is_bnb_quantization = quant in [Quantization.Q4, Quantization.Q8]
         
         # Check if this is a pre-quantized FP8 model
-        is_prequantized_fp8 = is_fp8_model(model_name) or HF_ALL_MODELS.get(model_name, {}).get("quantized", False)
+        is_prequantized_fp8 = is_prequantized_model(model_name)
         
         # Determine if we need to force SDPA (for FP8 or BitsAndBytes models)
         force_sdpa = is_prequantized_fp8 or is_bnb_quantization
@@ -654,7 +578,7 @@ class QwenVLBase:
         if self.model is not None:
             print("[QwenVL] Clearing previous model from memory before loading new configuration...")
         self.clear()
-        model_path = ensure_model(model_name)
+        model_path = str(get_local_model(model_name).path)
         quant_config, dtype, _ = quantization_config(model_name, quant)
         
         # Handle attention mode for loading
@@ -922,8 +846,8 @@ class QwenVLBase:
 class AILab_QwenVL(QwenVLBase):
     @classmethod
     def INPUT_TYPES(cls):
-        models = list(HF_VL_MODELS.keys())
-        default_model = models[0] if models else "Qwen3-VL-4B-Instruct"
+        models = model_scan.dropdown(list_vl_model_names())
+        default_model = models[0]
         prompts = PRESET_PROMPTS or ["Describe this image in detail."]
         preferred_prompt = "🖼️ Detailed Description"
         default_prompt = preferred_prompt if preferred_prompt in prompts else prompts[0]
@@ -956,8 +880,8 @@ class AILab_QwenVL(QwenVLBase):
 class AILab_QwenVL_Advanced(QwenVLBase):
     @classmethod
     def INPUT_TYPES(cls):
-        models = list(HF_VL_MODELS.keys())
-        default_model = models[0] if models else "Qwen3-VL-4B-Instruct"
+        models = model_scan.dropdown(list_vl_model_names())
+        default_model = models[0]
         prompts = PRESET_PROMPTS or ["Describe this image in detail."]
         preferred_prompt = "🖼️ Detailed Description"
         default_prompt = preferred_prompt if preferred_prompt in prompts else prompts[0]
