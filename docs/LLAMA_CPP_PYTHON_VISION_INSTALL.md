@@ -4,6 +4,7 @@ This plugin’s **QwenVL (GGUF)** vision nodes require a `llama-cpp-python` buil
 
 - `Qwen3VLChatHandler`
 - `Qwen25VLChatHandler`
+- `Gemma4ChatHandler` (Gemma 4 GGUF, JamePeng fork v0.3.35 or later — see [discussion #109](https://github.com/JamePeng/llama-cpp-python/discussions/109))
 
 The upstream `llama-cpp-python` from PyPI often does **not** include these vision handlers. Use a fork/build that provides them (e.g. JamePeng’s fork) and install a **Release wheel**.
 

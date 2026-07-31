@@ -15,8 +15,9 @@
 #   - Qwen3VLChatHandler / Qwen25VLChatHandler  -> Qwen-VL GGUFs
 #   - Gemma4ChatHandler                         -> Gemma 4 GGUFs
 #
-# Gemma 4 support requires the JamePeng fork of llama-cpp-python v0.3.35 or later:
-#   https://github.com/JamePeng/llama-cpp-python/discussions/109
+# Gemma 4 support requires the JamePeng fork of llama-cpp-python v0.3.35 or later.
+# See the install guide above (docs/LLAMA_CPP_PYTHON_VISION_INSTALL.md) for the
+# fork's discussion thread and wheel locations.
 # Earlier versions lack Gemma4ChatHandler; loading a Gemma GGUF will raise
 # ImportError from AILab_QwenVL_GGUF.py._load_model().
 #
