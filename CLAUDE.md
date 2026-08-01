@@ -14,6 +14,11 @@ pip install -r requirements.txt
 # SageAttention (optional): pip install sageattention
 ```
 
+`tools/install_helper.py` は CUDA 版 PyTorch と JamePeng fork の `llama-cpp-python` wheel を対象に、
+「今の環境に必要な pip コマンド」を出力する CLI（`--python` で ComfyUI portable の python.exe を指定可能、
+`--run` で実行、最新導入済みならその旨を表示）。ルート直下の `.py` は `__init__.py` に全て import されるため
+`tools/` 配下に置いてある。
+
 No test suite or linter is configured. Publishing to the ComfyUI registry is handled automatically via `.github/workflows/publish.yml` when `pyproject.toml` changes on main.
 
 ## Architecture

@@ -12,6 +12,28 @@ Release wheels (download `.whl` here):
 
 - [https://github.com/JamePeng/llama-cpp-python/releases](https://github.com/JamePeng/llama-cpp-python/releases/)
 
+## Quick start: let the helper build the pip command
+
+`tools/install_helper.py` detects your CUDA version, checks the PyTorch index and the
+JamePeng release assets, and prints the exact `pip install` command for the Python
+environment you point it at. It installs nothing unless you pass `--run`, and it tells
+you when everything is already up to date instead of printing a command.
+
+```bat
+python tools\install_helper.py --python "C:\AI\ComfyUI\python_embeded\python.exe"
+```
+
+Useful flags: `--cuda cu130` (skip detection), `--run` (execute the printed commands),
+`--force` (re-emit a command even when current), `--no-torch` / `--no-llama`.
+
+With `--python` you do **not** need the target env activated — the helper builds
+commands around that absolute path, and `--run` invokes it directly. Drop `--python`
+only when the env is already active, otherwise you will be reporting on whichever
+Python happens to be first on your PATH. On conda, activating is still the safer
+route on Windows: without it the probe's `import torch` can fail on DLL lookup, which
+costs the helper its `torch.version.cuda` reading (it then falls back to the version's
+local tag, e.g. `+cu130`).
+
 ## 0) Close ComfyUI first
 
 Stop ComfyUI before installing/replacing packages, especially on Windows portable.

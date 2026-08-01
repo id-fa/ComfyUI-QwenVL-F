@@ -14,6 +14,10 @@ This is a fork of [1038lab/ComfyUI-QwenVL](https://github.com/1038lab/ComfyUI-Qw
 - **Multiple image reference support**: Advanced nodes (HF / GGUF) accept up to 3 image inputs (`image`, `image2`, `image3`) for simultaneous multi-image analysis.
 - **Thinking mode toggle**: `enable_thinking` switch on all nodes (Simple / Advanced, HF / GGUF). Enables the `<think>...</think>` reasoning mode for Qwen3-VL Thinking models; disabled by default.
 - **Gemma 4 GGUF support**: GGUF nodes auto-detect Gemma models by filename and switch to `Gemma4ChatHandler`, bypass the Qwen-specific `/think` prefix injection and MROPE image-resize guard, and strip Gemma's `<|channel|>` reasoning markers from the output. Requires the [JamePeng fork of llama-cpp-python v0.3.35+](https://github.com/JamePeng/llama-cpp-python/discussions/109). Qwen models continue to work unchanged.
+- **Dependency install helper (`tools/install_helper.py`)**: A CLI that works out the `pip install` commands your environment needs for a CUDA build of PyTorch and a vision-capable `llama-cpp-python` wheel, and prints them — it installs nothing unless you pass `--run`. When everything is already current it says so instead of emitting a command. See the [install guide](docs/LLAMA_CPP_PYTHON_VISION_INSTALL.md).
+  - **Targets the right interpreter**: pass `--python "C:\AI\ComfyUI\python_embeded\python.exe"` and the report describes that environment (Python/ABI tag, installed versions), not the one running the script.
+  - **Picks a build that actually exists**: the CUDA version comes from `nvidia-smi` (falling back to `nvcc`, then `torch.version.cuda`), then the highest build not exceeding it is chosen from the PyTorch index and the JamePeng release assets — so a driver reporting CUDA 13.3 still resolves to the newest published wheels.
+  - **Only reports real work**: versions are compared before anything is printed, and a same-version-different-build case (e.g. `2.9.1` bundling cu126 against `2.9.1+cu130`) is flagged with the reason. Options: `--cuda`, `--force`, `--run`, `--no-torch` / `--no-llama`, `--repo`.
 
 ![QwenVL-F_GGUF_Advanced](example_workflows/mod1_adv.png)
 

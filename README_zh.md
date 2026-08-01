@@ -14,6 +14,10 @@
 - **多图参考支持**: Advanced 节点（HF / GGUF）最多接受 3 个图像输入（`image`、`image2`、`image3`），可同时分析多张图像。
 - **思考模式开关**: 所有节点（Simple / Advanced，HF / GGUF）均带有 `enable_thinking` 开关。为 Qwen3-VL Thinking 模型启用 `<think>...</think>` 推理模式；默认关闭。
 - **Gemma 4 GGUF 支持**: GGUF 节点通过文件名自动识别 Gemma 模型并切换到 `Gemma4ChatHandler`，跳过 Qwen 专用的 `/think` 前缀注入和 MROPE 图像缩放保护，并从输出中移除 Gemma 的 `<|channel|>` 推理标记。需要 [JamePeng 的 llama-cpp-python v0.3.35+ 分支](https://github.com/JamePeng/llama-cpp-python/discussions/109)。Qwen 模型的行为保持不变。
+- **依赖安装辅助工具（`tools/install_helper.py`）**: 一个命令行工具，用于推算当前环境所需的 `pip install` 命令 —— 包括 CUDA 版 PyTorch 与支持视觉功能的 `llama-cpp-python` wheel —— 并将其打印出来；除非传入 `--run`，否则不会安装任何内容。若全部已是最新版，则显示相应提示而不输出命令。参见[安装指南](docs/LLAMA_CPP_PYTHON_VISION_INSTALL.md)。
+  - **面向指定的解释器**: 传入 `--python "C:\AI\ComfyUI\python_embeded\python.exe"`，报告即针对该环境（Python / ABI 标签、已安装版本）生成，而非运行本脚本的环境。
+  - **选择实际存在的构建版本**: CUDA 版本依次通过 `nvidia-smi`（其次为 `nvcc`，再次为 `torch.version.cuda`）获取，然后从 PyTorch 索引与 JamePeng 发布资源中选出不超过该版本的最高构建 —— 因此驱动报告 CUDA 13.3 时仍能解析到已发布的最新 wheel。
+  - **仅提示确有必要的操作**: 输出前先比较版本；同版本但构建不同的情况（例如内置 cu126 的 `2.9.1` 与 `2.9.1+cu130`）会附带原因一并指出。可用选项：`--cuda`、`--force`、`--run`、`--no-torch` / `--no-llama`、`--repo`。
 
 ![QwenVL-F_GGUF_Advanced](example_workflows/mod1_adv.png)
 
