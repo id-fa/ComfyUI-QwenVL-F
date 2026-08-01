@@ -1,7 +1,7 @@
 [project]
 name = "QwenVL-F"
 description = "Fork of ComfyUI-QwenVL: Qwen-VL nodes (Qwen2.5-VL / Qwen3-VL, Transformers and GGUF backends) for text generation, image understanding, and video analysis. Adds local-only model discovery — models are picked from models/text_encoders and models/LLM with no automatic downloading — plus explicit mmproj selection, up to 3 image inputs on the Advanced nodes, a thinking-mode toggle, and Gemma 4 GGUF support."
-version = "2.1.1-mod4"
+version = "2.1.1-mod5"
 license = {file = "LICENSE"}
 dependencies = ["transformers", "torch", "huggingface-hub", "hf_xet", "psutil", "numpy", "Pillow", "opencv-python", "bitsandbytes", "accelerate"]
 

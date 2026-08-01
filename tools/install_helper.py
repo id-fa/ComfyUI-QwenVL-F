@@ -1,18 +1,21 @@
-# ComfyUI-QwenVL GPU dependency install helper
+# PyTorch / llama-cpp-python install helper
 #
 # Prints the pip commands needed to bring a target Python environment up to date
 # with a CUDA build of PyTorch and a vision-capable llama-cpp-python wheel
 # (JamePeng fork). Nothing is installed unless --run is passed; when everything
 # is already current the tool says so instead of emitting a command.
 #
+# Self-contained (standard library only) so it can be dropped into any ComfyUI
+# custom node pack that depends on llama-cpp-python.
+#
+# All user-facing output is bilingual (Japanese / English).
+#
 # Usage:
 #   python tools/install_helper.py
 #   python tools/install_helper.py --python "C:/AI/ComfyUI/python_embeded/python.exe"
 #   python tools/install_helper.py --cuda cu130 --run
 #
-# This integration script follows GPL-3.0 License.
-#
-# Source: https://github.com/1038lab/ComfyUI-QwenVL
+# This script follows GPL-3.0 License.
 
 from __future__ import annotations
 
@@ -22,6 +25,7 @@ import os
 import re
 import subprocess
 import sys
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -29,7 +33,7 @@ import urllib.request
 TORCH_INDEX_ROOT = "https://download.pytorch.org/whl"
 TORCH_PACKAGES = ["torch", "torchvision", "torchaudio"]
 DEFAULT_LLAMA_REPO = "JamePeng/llama-cpp-python"
-USER_AGENT = "ComfyUI-QwenVL-install-helper"
+USER_AGENT = "pytorch-llama-cpp-install-helper"
 HTTP_TIMEOUT = 30
 
 # Runs inside the *target* interpreter so the report describes that environment,
@@ -69,7 +73,7 @@ info = {
         "llama_cpp_python": dist_version("llama_cpp_python", "llama-cpp-python"),
     },
 }
-print("<<QWENVL_PROBE>>" + json.dumps(info))
+print("<<ENV_PROBE>>" + json.dumps(info))
 """
 
 _WHEEL_RE = re.compile(
@@ -83,12 +87,61 @@ _CUDA_TAG_RE = re.compile(r"^cu(\d+)$")
 
 
 # --------------------------------------------------------------------------- #
-# small helpers
+# bilingual output helpers
 # --------------------------------------------------------------------------- #
 
 def log(message: str = "") -> None:
     print(message)
 
+
+def bi(ja: str, en: str) -> str:
+    """Inline pair for short fragments: "最新 / up to date"."""
+    return f"{ja} / {en}"
+
+
+def log_lines(ja: str, en: str, indent: str = "  ") -> None:
+    """Sentence-length messages get one line per language."""
+    log(f"{indent}{ja}")
+    log(f"{indent}{en}")
+
+
+def log_summary(ja: str, en: str, indent: str = "  ") -> None:
+    log(f"{indent}=> {ja}")
+    log(f"{indent}   {en}")
+
+
+def log_warn(ja: str, en: str, indent: str = "  ") -> None:
+    log(f"{indent}[!] {ja}")
+    log(f"{indent}    {en}")
+
+
+ERROR_HEAD = "[エラー / Error] "
+
+
+def display_width(text: str) -> int:
+    """Console cells, so a head containing 全角 lines up with its continuation."""
+    return sum(2 if unicodedata.east_asian_width(char) in "WF" else 1 for char in text)
+
+
+def log_error(ja: str, en: str, detail: str | None = None, indent: str = "  ") -> None:
+    pad = " " * display_width(ERROR_HEAD)
+    log(f"{indent}{ERROR_HEAD}{ja}")
+    log(f"{indent}{pad}{en}")
+    if detail:
+        log(f"{indent}{pad}{detail}")
+
+
+def fail(ja: str, en: str, detail: str | None = None) -> "SystemExit":
+    pad = " " * display_width(ERROR_HEAD)
+    message = f"{ERROR_HEAD}{ja}\n{pad}{en}"
+    if detail:
+        message += f"\n{detail}"
+    return SystemExit(message)
+
+
+# --------------------------------------------------------------------------- #
+# small helpers
+# --------------------------------------------------------------------------- #
 
 def http_get(url: str, accept: str | None = None) -> bytes:
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
@@ -207,15 +260,23 @@ def probe_environment(python_exe: str) -> Environment:
             timeout=120,
         )
     except FileNotFoundError:
-        raise SystemExit(f"[エラー] Python が見つかりません: {python_exe}")
+        raise fail(
+            f"Python が見つかりません: {python_exe}",
+            f"Python executable not found: {python_exe}",
+        )
     if output.returncode != 0:
-        raise SystemExit(
-            f"[エラー] 環境情報の取得に失敗しました ({python_exe})\n{output.stderr.strip()}"
+        raise fail(
+            f"環境情報の取得に失敗しました ({python_exe})",
+            f"Failed to inspect the target environment ({python_exe})",
+            output.stderr.strip(),
         )
     for line in output.stdout.splitlines():
-        if line.startswith("<<QWENVL_PROBE>>"):
-            return Environment(json.loads(line[len("<<QWENVL_PROBE>>"):]))
-    raise SystemExit(f"[エラー] 環境情報を解釈できませんでした ({python_exe})")
+        if line.startswith("<<ENV_PROBE>>"):
+            return Environment(json.loads(line[len("<<ENV_PROBE>>"):]))
+    raise fail(
+        f"環境情報を解釈できませんでした ({python_exe})",
+        f"Could not parse the environment report ({python_exe})",
+    )
 
 
 def detect_cuda_tag() -> tuple[str | None, str]:
@@ -242,7 +303,7 @@ def detect_cuda_tag() -> tuple[str | None, str]:
     except Exception:
         pass
 
-    return None, "検出できず"
+    return None, bi("検出できず", "not detected")
 
 
 # --------------------------------------------------------------------------- #
@@ -329,21 +390,28 @@ def fetch_llama_assets(repo: str, per_page: int, env: Environment) -> list[dict]
 # --------------------------------------------------------------------------- #
 
 def describe(installed: str | None) -> str:
-    return installed if installed else "未インストール"
+    return installed if installed else bi("未インストール", "not installed")
 
 
 def plan_torch(env: Environment, cuda_tag: str | None, force: bool) -> list[str]:
     log("[PyTorch]")
 
     if env.platform_tag is None:
-        log(f"  このプラットフォームは非対応です ({env.system}/{env.machine})。手動で導入してください。")
+        log_lines(
+            f"このプラットフォームは非対応です ({env.system}/{env.machine})。手動で導入してください。",
+            f"Unsupported platform ({env.system}/{env.machine}); install it manually.",
+        )
         log("")
         return []
 
     try:
         available = fetch_torch_cuda_tags()
     except Exception as exc:
-        log(f"  [エラー] PyTorch インデックスを取得できませんでした: {exc}")
+        log_error(
+            "PyTorch インデックスを取得できませんでした",
+            "Failed to fetch the PyTorch index",
+            str(exc),
+        )
         log("")
         return []
 
@@ -351,12 +419,18 @@ def plan_torch(env: Environment, cuda_tag: str | None, force: bool) -> list[str]
     if index_tag is None:
         index_tag = "cpu"
         if cuda_tag:
-            log(f"  [!] {cuda_tag} 以下の CUDA ビルドが見つからないため CPU 版を対象にします。")
+            log_warn(
+                f"{cuda_tag} 以下の CUDA ビルドが見つからないため CPU 版を対象にします。",
+                f"No CUDA build at or below {cuda_tag}; targeting the CPU build instead.",
+            )
     elif cuda_tag and index_tag != cuda_tag:
-        log(f"  [!] {cuda_tag} 用のビルドが無いため {index_tag} を使用します。")
+        log_warn(
+            f"{cuda_tag} 用のビルドが無いため {index_tag} を使用します。",
+            f"No {cuda_tag} build is published; using {index_tag} instead.",
+        )
 
     index_url = f"{TORCH_INDEX_ROOT}/{index_tag}"
-    log(f"  インデックス : {index_url}")
+    log(f"  Index       : {index_url}")
 
     # torch は必ず対象。vision/audio は既に入っているものだけ追随させる。
     targets = [name for name in TORCH_PACKAGES if name == "torch" or env.installed.get(name)]
@@ -368,44 +442,57 @@ def plan_torch(env: Environment, cuda_tag: str | None, force: bool) -> list[str]
         try:
             latest = fetch_latest_torch_version(index_tag, package, env)
         except Exception as exc:
-            log(f"  {package:<12}: {describe(installed)} (最新版の確認に失敗: {exc})")
+            note = bi("最新版の確認に失敗", "version check failed")
+            log(f"  {package:<12}: {describe(installed)} ({note}: {exc})")
             continue
 
         if latest is None:
             # このインデックスに存在しない以上、-U の対象には含められない。
-            log(f"  {package:<12}: {describe(installed)} ({index_tag} 用の配布なし)")
+            note = bi(f"{index_tag} 用の配布なし", f"not published for {index_tag}")
+            log(f"  {package:<12}: {describe(installed)} ({note})")
             unavailable.append(package)
             continue
 
         if installed is None:
-            log(f"  {package:<12}: 未インストール -> 最新 {latest}")
+            log(f"  {package:<12}: {describe(installed)} -> {latest}")
             needs_update = True
             continue
 
         # PyPI 版はローカルタグを持たないので torch.version.cuda を代用する。
         build = local_tag(installed) or (cuda_tag_from_version(env.torch_cuda) or "")
         if version_key(installed) < version_key(latest):
-            log(f"  {package:<12}: {installed} -> 最新 {latest} (更新あり)")
+            note = bi("更新あり", "update available")
+            log(f"  {package:<12}: {installed} -> {latest} ({note})")
             needs_update = True
         elif build and build != index_tag:
-            log(f"  {package:<12}: {installed} (ビルド {build} != {index_tag})")
+            note = bi("ビルド不一致", "build mismatch")
+            log(f"  {package:<12}: {installed} ({note}: {build} != {index_tag})")
             needs_update = True
         else:
-            log(f"  {package:<12}: {installed} (最新)")
+            log(f"  {package:<12}: {installed} ({bi('最新', 'up to date')})")
 
     if not needs_update and not force:
-        log("  => 更新はありません。最新版が導入済みです。")
+        log_summary(
+            "更新はありません。最新版が導入済みです。",
+            "No update needed; the latest build is already installed.",
+        )
         log("")
         return []
 
-    if not needs_update and force:
-        log("  => 更新は不要ですが --force が指定されたためコマンドを出力します。")
-    elif needs_update:
-        log("  => 更新が必要です。")
+    if force and not needs_update:
+        log_summary(
+            "更新は不要ですが --force が指定されたためコマンドを出力します。",
+            "Already current, but --force was given, so a command is printed anyway.",
+        )
+    else:
+        log_summary("更新が必要です。", "An update is required.")
 
-    installable =[package for package in targets if package not in unavailable]
+    installable = [package for package in targets if package not in unavailable]
     if not installable:
-        log(f"  [!] {index_tag} 用に導入できるパッケージがありません。")
+        log_warn(
+            f"{index_tag} 用に導入できるパッケージがありません。",
+            f"No package can be installed from the {index_tag} index.",
+        )
         log("")
         return []
 
@@ -421,23 +508,37 @@ def plan_llama(env: Environment, cuda_tag: str | None, repo: str, per_page: int,
     log(f"[llama-cpp-python ({repo})]")
 
     installed = env.installed.get("llama_cpp_python")
-    log(f"  導入済み     : {describe(installed)}")
+    log(f"  Installed   : {describe(installed)}")
 
     if env.platform_tag is None:
-        log(f"  このプラットフォーム向けの wheel は配布されていません ({env.system}/{env.machine})。")
+        log_lines(
+            f"このプラットフォーム向けの wheel は配布されていません ({env.system}/{env.machine})。",
+            f"No wheel is published for this platform ({env.system}/{env.machine}).",
+        )
         log("")
         return []
 
     try:
         candidates = fetch_llama_assets(repo, per_page, env)
     except Exception as exc:
-        log(f"  [エラー] リリース情報を取得できませんでした: {exc}")
+        log_error(
+            "リリース情報を取得できませんでした",
+            "Failed to fetch the release list",
+            str(exc),
+        )
         log("")
         return []
 
     if not candidates:
-        log(f"  [!] {env.py_tag}/{env.platform_tag} に一致する wheel が見つかりませんでした。")
-        log(f"      https://github.com/{repo}/releases を直接確認してください。")
+        log_warn(
+            f"{env.py_tag}/{env.platform_tag} に一致する wheel が見つかりませんでした。",
+            f"No wheel matches {env.py_tag}/{env.platform_tag}.",
+        )
+        log_lines(
+            f"https://github.com/{repo}/releases を直接確認してください。",
+            f"Check https://github.com/{repo}/releases directly.",
+            indent="      ",
+        )
         log("")
         return []
 
@@ -445,39 +546,60 @@ def plan_llama(env: Environment, cuda_tag: str | None, repo: str, per_page: int,
     if build_tag is None:
         cpu_candidates = [item for item in candidates if not item["cuda"]]
         if not cpu_candidates:
-            log(f"  [!] {cuda_tag or 'CPU'} に適合する wheel が見つかりませんでした。")
+            log_warn(
+                f"{cuda_tag or 'CPU'} に適合する wheel が見つかりませんでした。",
+                f"No wheel matches {cuda_tag or 'CPU'}.",
+            )
             log("")
             return []
         if cuda_tag:
-            log(f"  [!] {cuda_tag} 以下の CUDA ビルドが無いため CPU 版を対象にします。")
+            log_warn(
+                f"{cuda_tag} 以下の CUDA ビルドが無いため CPU 版を対象にします。",
+                f"No CUDA build at or below {cuda_tag}; targeting the CPU build instead.",
+            )
         pool = cpu_candidates
         build_tag = "cpu"
     else:
         if cuda_tag and build_tag != cuda_tag:
-            log(f"  [!] {cuda_tag} 用のビルドが無いため {build_tag} を使用します。")
+            log_warn(
+                f"{cuda_tag} 用のビルドが無いため {build_tag} を使用します。",
+                f"No {cuda_tag} build is published; using {build_tag} instead.",
+            )
         pool = [item for item in candidates if item["cuda"] == build_tag]
 
     best = max(pool, key=lambda item: version_key(item["version"]))
-    log(f"  最新         : {best['version']}  ({best['filename']})")
+    log(f"  Latest      : {best['version']}  ({best['filename']})")
 
+    reason_ja = reason_en = ""
     if installed is None:
-        needs_update, reason = True, "未インストール"
+        needs_update = True
+        reason_ja, reason_en = "未インストールです。", "It is not installed."
     elif version_key(installed) < version_key(best["version"]):
-        needs_update, reason = True, "新しいバージョンがあります"
+        needs_update = True
+        reason_ja, reason_en = "新しいバージョンがあります。", "A newer version is available."
     elif local_tag(installed) and local_tag(installed) != local_tag(best["version"]):
-        needs_update, reason = True, f"バージョンは同じですがビルドが異なります ({local_tag(installed)} != {build_tag})"
+        needs_update = True
+        detail = f"({local_tag(installed)} != {build_tag})"
+        reason_ja = f"バージョンは同じですがビルドが異なります {detail}"
+        reason_en = f"Same version, different build {detail}"
     else:
-        needs_update, reason = False, ""
+        needs_update = False
 
     if not needs_update and not force:
-        log("  => 更新はありません。最新版が導入済みです。")
+        log_summary(
+            "更新はありません。最新版が導入済みです。",
+            "No update needed; the latest build is already installed.",
+        )
         log("")
         return []
 
     if needs_update:
-        log(f"  => {reason}")
+        log_summary(reason_ja, reason_en)
     else:
-        log("  => 更新は不要ですが --force が指定されたためコマンドを出力します。")
+        log_summary(
+            "更新は不要ですが --force が指定されたためコマンドを出力します。",
+            "Already current, but --force was given, so a command is printed anyway.",
+        )
 
     command = (
         f"{quote(env.executable)} -m pip install -U --force-reinstall --no-cache-dir "
@@ -493,10 +615,13 @@ def plan_llama(env: Environment, cuda_tag: str | None, repo: str, per_page: int,
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="ComfyUI-QwenVL 用に、CUDA 版 PyTorch と vision 対応 llama-cpp-python の "
-                    "pip コマンドを取得します（既に最新ならその旨を表示します）。",
+        description="CUDA 版 PyTorch と vision 対応 llama-cpp-python の "
+                    "pip コマンドを取得します（既に最新ならその旨を表示します）。\n"
+                    "Works out the pip commands this environment needs for a CUDA build of "
+                    "PyTorch and a vision-capable llama-cpp-python wheel (and says so when "
+                    "everything is already current).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="例:\n"
+        epilog="例 / Examples:\n"
                "  python tools/install_helper.py\n"
                '  python tools/install_helper.py --python "C:/AI/ComfyUI/python_embeded/python.exe"\n'
                "  python tools/install_helper.py --cuda cu130 --run\n",
@@ -507,34 +632,51 @@ def build_parser() -> argparse.ArgumentParser:
         help="対象の Python 実行ファイル（既定: このスクリプトを実行中の Python）。"
              "ComfyUI portable なら python_embeded/python.exe を指定します。"
              "指定した場合その環境を activate しておく必要はありません。"
-             "省略時は実行中の環境が対象になるため、venv は activate してから実行してください。",
+             "省略時は実行中の環境が対象になるため、venv は activate してから実行してください。"
+             " / Target Python executable (default: the one running this script). "
+             "For ComfyUI portable, point it at python_embeded/python.exe. "
+             "No need to activate that environment when this is given; without it the "
+             "currently active environment is inspected instead.",
     )
     parser.add_argument(
         "--cuda",
-        help="CUDA タグを手動指定します（例: cu130、CPU 版なら cpu）。既定は自動検出。",
+        help="CUDA タグを手動指定します（例: cu130、CPU 版なら cpu）。既定は自動検出。"
+             " / Force a CUDA tag (e.g. cu130, or cpu for CPU builds). Default: auto-detect.",
     )
-    parser.add_argument("--no-torch", action="store_true", help="PyTorch のチェックを行いません。")
-    parser.add_argument("--no-llama", action="store_true", help="llama-cpp-python のチェックを行いません。")
+    parser.add_argument(
+        "--no-torch",
+        action="store_true",
+        help="PyTorch のチェックを行いません。 / Skip the PyTorch check.",
+    )
+    parser.add_argument(
+        "--no-llama",
+        action="store_true",
+        help="llama-cpp-python のチェックを行いません。 / Skip the llama-cpp-python check.",
+    )
     parser.add_argument(
         "--repo",
         default=DEFAULT_LLAMA_REPO,
-        help=f"llama-cpp-python の wheel 配布リポジトリ（既定: {DEFAULT_LLAMA_REPO}）。",
+        help=f"llama-cpp-python の wheel 配布リポジトリ（既定: {DEFAULT_LLAMA_REPO}）。"
+             f" / Repository publishing the llama-cpp-python wheels (default: {DEFAULT_LLAMA_REPO}).",
     )
     parser.add_argument(
         "--search-limit",
         type=int,
         default=100,
-        help="GitHub から取得するリリース数（既定: 100）。",
+        help="GitHub から取得するリリース数（既定: 100）。"
+             " / Number of GitHub releases to scan (default: 100).",
     )
     parser.add_argument(
         "--force",
         action="store_true",
-        help="最新版が導入済みでもコマンドを出力します（再インストール用）。",
+        help="最新版が導入済みでもコマンドを出力します（再インストール用）。"
+             " / Print a command even when everything is current (for a reinstall).",
     )
     parser.add_argument(
         "--run",
         action="store_true",
-        help="表示した pip コマンドをそのまま実行します（ComfyUI を停止してから使用）。",
+        help="表示した pip コマンドをそのまま実行します（ComfyUI を停止してから使用）。"
+             " / Execute the printed pip commands (stop ComfyUI first).",
     )
     return parser
 
@@ -551,23 +693,30 @@ def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
 
     log("=" * 66)
-    log(" ComfyUI-QwenVL GPU 依存パッケージ インストールヘルパー")
+    log(" PyTorch / llama-cpp-python インストールヘルパー")
+    log(" PyTorch / llama-cpp-python install helper")
     log("=" * 66)
 
     env = probe_environment(args.python)
 
     if args.cuda:
         cuda_tag = None if args.cuda.lower() == "cpu" else args.cuda.lower()
-        cuda_source = "手動指定"
+        cuda_source = bi("手動指定", "manual")
     else:
         cuda_tag, cuda_source = detect_cuda_tag()
 
-    log("[環境]")
-    log(f"  Python       : {env.version} ({env.py_tag}/{env.abi_tag}, {env.platform_tag or env.machine})")
-    log(f"  実行ファイル : {env.executable}")
-    log(f"  CUDA         : {cuda_tag or 'なし (CPU 版が対象)'}  ({cuda_source})")
+    log("[環境 / Environment]")
+    log(f"  Python      : {env.version} ({env.py_tag}/{env.abi_tag}, {env.platform_tag or env.machine})")
+    log(f"  Executable  : {env.executable}")
+    log(f"  CUDA        : {cuda_tag or bi('なし', 'none')}  ({cuda_source})")
+    if not cuda_tag:
+        log_lines(
+            "CPU 版を対象にします。",
+            "CPU builds will be targeted.",
+            indent="                ",
+        )
     if env.torch_cuda:
-        log(f"  torch ビルド : cuda {env.torch_cuda}")
+        log(f"  torch build : cuda {env.torch_cuda}")
     log("")
 
     commands: list[str] = []
@@ -579,35 +728,67 @@ def main(argv=None) -> int:
     log("-" * 66)
     if not commands:
         if args.no_torch and args.no_llama:
-            log("チェック対象がありません（--no-torch と --no-llama の両方が指定されています）。")
+            log_lines(
+                "チェック対象がありません（--no-torch と --no-llama の両方が指定されています）。",
+                "Nothing to check (both --no-torch and --no-llama were given).",
+                indent="",
+            )
         else:
-            log("実行が必要なコマンドはありません。すべて最新版が導入済みです。")
+            log_lines(
+                "実行が必要なコマンドはありません。すべて最新版が導入済みです。",
+                "No command to run; everything is already up to date.",
+                indent="",
+            )
         return 0
 
-    log("以下の pip コマンドを実行してください:")
+    log_lines(
+        "以下の pip コマンドを実行してください:",
+        "Run the following pip command(s):",
+        indent="",
+    )
     log("")
     for command in commands:
         log(f"  {command}")
     log("")
     if os.name == "nt":
-        log("※ PowerShell では先頭に & を付けてください（例: & \"C:\\...\\python.exe\" -m pip ...）。")
-    log("※ ComfyUI を終了してから実行してください。")
+        log_lines(
+            '※ PowerShell では先頭に & を付けてください（例: & "C:\\...\\python.exe" -m pip ...）。',
+            '   In PowerShell, prefix the command with & (e.g. & "C:\\...\\python.exe" -m pip ...).',
+            indent="",
+        )
+    log_lines(
+        "※ ComfyUI を終了してから実行してください。",
+        "   Stop ComfyUI before running it.",
+        indent="",
+    )
 
     if not args.run:
-        log("※ --run を付けて実行すると、上記コマンドをこのツールが実行します。")
+        log_lines(
+            "※ --run を付けて実行すると、上記コマンドをこのツールが実行します。",
+            "   Re-run with --run to have this tool execute the commands above.",
+            indent="",
+        )
         return 0
 
     log("")
-    log("--run が指定されました。コマンドを実行します。")
+    log_lines(
+        "--run が指定されました。コマンドを実行します。",
+        "--run was given; executing the commands now.",
+        indent="",
+    )
     for command in commands:
         log("")
         log(f"$ {command}")
         result = subprocess.run(command, shell=True)
         if result.returncode != 0:
-            log(f"[エラー] コマンドが失敗しました (exit={result.returncode})")
+            log_error(
+                f"コマンドが失敗しました (exit={result.returncode})",
+                f"The command failed (exit={result.returncode})",
+                indent="",
+            )
             return result.returncode
     log("")
-    log("完了しました。")
+    log_lines("完了しました。", "Done.", indent="")
     return 0
 
 
