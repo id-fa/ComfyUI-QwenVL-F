@@ -5,6 +5,12 @@
 # (JamePeng fork). Nothing is installed unless --run is passed; when everything
 # is already current the tool says so instead of emitting a command.
 #
+# torch / torchvision / torchaudio are always planned as one matching set. When the
+# official index publishes no wheel for a package/CUDA/platform combination
+# (currently torchaudio on cu132 + Windows), a third-party build hosted on Hugging
+# Face is used; --no-fallback turns that off, in which case the plan steps down to
+# the newest CUDA index where every package lines up on the same release.
+#
 # Self-contained (standard library only) so it can be dropped into any ComfyUI
 # custom node pack that depends on llama-cpp-python.
 #
@@ -33,6 +39,8 @@ import urllib.request
 TORCH_INDEX_ROOT = "https://download.pytorch.org/whl"
 TORCH_PACKAGES = ["torch", "torchvision", "torchaudio"]
 DEFAULT_LLAMA_REPO = "JamePeng/llama-cpp-python"
+HF_API_ROOT = "https://huggingface.co/api"
+HF_RESOLVE_ROOT = "https://huggingface.co"
 USER_AGENT = "pytorch-llama-cpp-install-helper"
 HTTP_TIMEOUT = 30
 
@@ -320,19 +328,34 @@ def fetch_torch_cuda_tags() -> list[str]:
     return sorted(tags)
 
 
-def fetch_latest_torch_version(index_tag: str, package: str, env: Environment) -> str | None:
-    url = f"{TORCH_INDEX_ROOT}/{index_tag}/{package}/"
+def usable_cuda_tags(available, wanted: str | None) -> list[str]:
+    """wanted 以下の CUDA タグを新しい順に。1 段下げる先の候補になる。"""
+    wanted_value = cuda_tag_value(wanted or "")
+    if wanted_value is None:
+        return []
+    pairs = []
+    for tag in available:
+        value = cuda_tag_value(tag)
+        if value is not None and value <= wanted_value:
+            pairs.append((value, tag))
+    return [tag for _, tag in sorted(pairs, reverse=True)]
+
+
+def fetch_index_wheels(index_tag: str, package: str, env: Environment) -> list[dict]:
+    """このインデックスにある、この環境に載る wheel を列挙する。未配布なら空。"""
+    page = f"{TORCH_INDEX_ROOT}/{index_tag}/{package}/"
     try:
-        html = http_get(url).decode("utf-8", "replace")
+        html = http_get(page).decode("utf-8", "replace")
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
-            return None
+            return []
         raise
 
     platform_tag = env.platform_tag
-    best = None
+    wheels = []
     for href in _HREF_RE.findall(html):
-        filename = urllib.parse.unquote(href.split("#", 1)[0].strip("/").split("/")[-1])
+        target = href.split("#", 1)[0]
+        filename = urllib.parse.unquote(target.strip("/").split("/")[-1])
         parsed = _WHEEL_RE.match(filename)
         if not parsed or parsed.group("name").lower() != package.lower():
             continue
@@ -342,10 +365,79 @@ def fetch_latest_torch_version(index_tag: str, package: str, env: Environment) -
             continue
         if platform_tag and not platform_matches(parsed.group("plat"), platform_tag):
             continue
-        version = parsed.group("version")
-        if best is None or version_key(version) > version_key(best):
-            best = version
-    return best
+        url = urllib.parse.urljoin(page, target)
+        wheels.append(
+            {
+                "source": "index",
+                "filename": filename,
+                "version": parsed.group("version"),
+                "url": url,
+                # PEP 658。PyTorch のインデックスは data-core-metadata を出しており、
+                # wheel 本体を落とさずに Requires-Dist を読める。
+                "metadata_url": f"{url}.metadata",
+            }
+        )
+    return wheels
+
+
+def base_version(version: str | None) -> str:
+    """"2.11.0+cu130" -> "2.11.0"。リリース番号の突き合わせに使う。"""
+    return (version or "").split("+", 1)[0]
+
+
+def latest_entry(entries: list[dict]) -> dict | None:
+    if not entries:
+        return None
+    return max(entries, key=lambda entry: version_key(entry["version"]))
+
+
+def index_by_base(entries: list[dict]) -> dict:
+    """リリース番号 -> その番号のうち最新のエントリ。"""
+    table: dict[str, dict] = {}
+    for entry in entries:
+        key = base_version(entry["version"])
+        current = table.get(key)
+        if current is None or version_key(entry["version"]) > version_key(current["version"]):
+            table[key] = entry
+    return table
+
+
+_REQUIRES_TORCH_RE = re.compile(
+    r"^Requires-Dist:\s*torch\s*\(?\s*==\s*([0-9][^\s,)\];]*)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def required_torch_version(metadata_text: str) -> str | None:
+    match = _REQUIRES_TORCH_RE.search(metadata_text)
+    return match.group(1) if match else None
+
+
+def resolve_companion(entries: list[dict], release: str, limit: int = 12) -> dict | None:
+    """torch==<release> を要求する最新の wheel を PEP 658 メタデータから探す。
+
+    torchvision は torch と番号体系が違う（torch 2.11.0 <-> torchvision 0.26.0）ので、
+    対応版はメタデータを読まないと特定できない。
+    """
+    wanted = base_version(release)
+    ordered = sorted(entries, key=lambda entry: version_key(entry["version"]), reverse=True)
+    for entry in ordered[:limit]:
+        metadata_url = entry.get("metadata_url")
+        if not metadata_url:
+            continue
+        try:
+            text = http_get(metadata_url).decode("utf-8", "replace")
+        except Exception:
+            return None
+        needed = required_torch_version(text)
+        if needed is None:
+            continue
+        if base_version(needed) == wanted:
+            return entry
+        if version_key(needed) < version_key(wanted):
+            # これより古い wheel は更に古い torch を要求するので打ち切る。
+            break
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -386,6 +478,69 @@ def fetch_llama_assets(repo: str, per_page: int, env: Environment) -> list[dict]
 
 
 # --------------------------------------------------------------------------- #
+# fallback wheels (Hugging Face)
+# --------------------------------------------------------------------------- #
+
+# 公式インデックスに wheel が置かれない組み合わせの受け皿。現状は cu132 の
+# Windows 版 torchaudio だけが該当する（cu132 インデックスには torchaudio の
+# CUDA ビルドが 1 つも無い）。いずれも非公式ビルドなので、明示的に列挙した
+# 組み合わせにしか使わない。
+FALLBACK_WHEEL_SOURCES = [
+    {
+        "package": "torchaudio",
+        "cuda": "cu132",
+        "platform": "win_amd64",
+        "repo": "ussoewwin/torchaudio-built-on-cu132-for-windows",
+    },
+]
+
+
+def find_fallback_source(package: str, index_tag: str, platform_tag: str | None):
+    for source in FALLBACK_WHEEL_SOURCES:
+        if source["package"] != package or source["cuda"] != index_tag:
+            continue
+        if platform_tag and source["platform"] != platform_tag:
+            continue
+        return source
+    return None
+
+
+def fetch_hf_wheels(repo: str, package: str, env: Environment) -> list[dict]:
+    """Hugging Face リポジトリ内の wheel から、この環境に載るものを列挙する。"""
+    data = json.loads(
+        http_get(f"{HF_API_ROOT}/models/{repo}", accept="application/json").decode("utf-8")
+    )
+    platform_tag = env.platform_tag
+
+    candidates = []
+    for sibling in data.get("siblings") or []:
+        path = sibling.get("rfilename") or ""
+        if not path.lower().endswith(".whl"):
+            continue
+        filename = path.rsplit("/", 1)[-1]
+        parsed = _WHEEL_RE.match(filename)
+        if not parsed or parsed.group("name").lower() != package.lower():
+            continue
+        if not tag_matches(parsed.group("py"), env.py_tag):
+            continue
+        if not tag_matches(parsed.group("abi"), env.abi_tag):
+            continue
+        if platform_tag and not platform_matches(parsed.group("plat"), platform_tag):
+            continue
+        candidates.append(
+            {
+                "source": "fallback",
+                "repo": repo,
+                "filename": filename,
+                "version": parsed.group("version"),
+                # ファイル名の "+" はそのままでも通るが、念のためエスケープする。
+                "url": f"{HF_RESOLVE_ROOT}/{repo}/resolve/main/{urllib.parse.quote(path)}",
+            }
+        )
+    return candidates
+
+
+# --------------------------------------------------------------------------- #
 # planning
 # --------------------------------------------------------------------------- #
 
@@ -393,7 +548,130 @@ def describe(installed: str | None) -> str:
     return installed if installed else bi("未インストール", "not installed")
 
 
-def plan_torch(env: Environment, cuda_tag: str | None, force: bool) -> list[str]:
+# 同じリリース番号で揃っていないと ABI が合わないパッケージ。torchvision も
+# torch に固定されるが番号体系が違うため、resolve_companion で別途解決する。
+TORCH_ALIGNED_PACKAGES = ("torch", "torchaudio")
+
+# 1 段下げを繰り返しすぎないための上限（1 タグあたり数回の HTTP が走る）。
+MAX_INDEX_ATTEMPTS = 4
+
+
+def collect_pool(env: Environment, index_tag: str, package: str, use_fallback: bool) -> dict:
+    """公式インデックスと（あれば）代替ビルドの wheel をまとめて集める。"""
+    pool = {"index": [], "fallback": [], "repo": None, "error": None}
+    try:
+        pool["index"] = fetch_index_wheels(index_tag, package, env)
+    except Exception as exc:
+        pool["error"] = str(exc)
+
+    if use_fallback:
+        source = find_fallback_source(package, index_tag, env.platform_tag)
+        if source is not None:
+            pool["repo"] = source["repo"]
+            try:
+                pool["fallback"] = fetch_hf_wheels(source["repo"], package, env)
+            except Exception as exc:
+                pool["error"] = pool["error"] or str(exc)
+    return pool
+
+
+def merged_entries(pool: dict) -> dict:
+    """リリース番号 -> エントリ。同じ番号なら公式インデックスを優先する。"""
+    table = index_by_base(pool["fallback"])
+    table.update(index_by_base(pool["index"]))
+    return table
+
+
+def choose_release(pools: dict, aligned: list[str]) -> str | None:
+    """揃えるべきパッケージ全部が出せる最大のリリース番号。"""
+    common: set | None = None
+    for package in aligned:
+        keys = set(merged_entries(pools[package]))
+        common = keys if common is None else (common & keys)
+    if not common:
+        return None
+    return max(common, key=version_key)
+
+
+def resolve_index(env: Environment, targets: list[str], candidate_tags: list[str], use_fallback: bool):
+    """torch と torchaudio が揃うインデックスを、新しい順に探す。
+
+    見つからなければ最初に試したインデックスをそのまま返す（従来どおり
+    「取れるものだけ最新にする」動作にフォールバックする）。
+    """
+    aligned = [name for name in targets if name in TORCH_ALIGNED_PACKAGES]
+    first = None
+    for index_tag in candidate_tags[:MAX_INDEX_ATTEMPTS]:
+        pools = {name: collect_pool(env, index_tag, name, use_fallback) for name in targets}
+        attempt = {"index_tag": index_tag, "pools": pools, "release": choose_release(pools, aligned)}
+        first = first or attempt
+        if attempt["release"] is not None:
+            return attempt, first
+    return first, first
+
+
+def select_wheels(attempt: dict, targets: list[str]) -> tuple[dict, bool]:
+    """パッケージごとに入れるべき wheel を決める。戻り値は (選択, ピン留めが必要か)。"""
+    release = attempt["release"]
+    pools = attempt["pools"]
+
+    torch_entries = pools["torch"]["index"] + pools["torch"]["fallback"]
+    torch_latest = latest_entry(torch_entries)
+    # 最新をそのまま入れられないなら == で固定しないと pip がダウングレードしない。
+    pinning = bool(
+        release
+        and torch_latest is not None
+        and base_version(torch_latest["version"]) != release
+    )
+
+    chosen: dict[str, dict | None] = {}
+    for package in targets:
+        pool = pools[package]
+        if package in TORCH_ALIGNED_PACKAGES and release:
+            chosen[package] = merged_entries(pool).get(release)
+        elif pinning and package == "torchvision":
+            chosen[package] = resolve_companion(pool["index"], release)
+        else:
+            chosen[package] = latest_entry(pool["index"] + pool["fallback"])
+    return chosen, pinning
+
+
+def log_package(env: Environment, package: str, entry: dict | None) -> bool:
+    """1 行分の状態表示。戻り値は「導入・更新が必要か」。"""
+    installed = env.installed.get(package)
+    if entry is None:
+        note = bi("配布なし", "not published")
+        log(f"  {package:<12}: {describe(installed)} ({note})")
+        return False
+
+    target = entry["version"]
+    suffix = f"  [{bi('代替', 'fallback')}]" if entry.get("source") == "fallback" else ""
+
+    if installed is None:
+        log(f"  {package:<12}: {describe(installed)} -> {target}{suffix}")
+        return True
+
+    # PyPI 版はローカルタグを持たないので torch.version.cuda を代用する。
+    installed_build = local_tag(installed) or (cuda_tag_from_version(env.torch_cuda) or "")
+    target_build = local_tag(target)
+
+    if version_key(installed) < version_key(target):
+        note = bi("更新あり", "update available")
+    elif version_key(installed) > version_key(target):
+        note = bi("ダウングレード", "downgrade")
+    elif installed_build and target_build and installed_build != target_build:
+        note = bi("ビルド不一致", "build mismatch")
+    else:
+        log(f"  {package:<12}: {installed} ({bi('最新', 'up to date')}){suffix}")
+        return False
+
+    log(f"  {package:<12}: {installed} -> {target} ({note}){suffix}")
+    return True
+
+
+def plan_torch(
+    env: Environment, cuda_tag: str | None, force: bool, use_fallback: bool = True
+) -> list[str]:
     log("[PyTorch]")
 
     if env.platform_tag is None:
@@ -415,63 +693,121 @@ def plan_torch(env: Environment, cuda_tag: str | None, force: bool) -> list[str]
         log("")
         return []
 
-    index_tag = pick_cuda_tag(available, cuda_tag) if cuda_tag else None
-    if index_tag is None:
-        index_tag = "cpu"
+    candidate_tags = usable_cuda_tags(available, cuda_tag) if cuda_tag else []
+    if not candidate_tags:
+        candidate_tags = ["cpu"]
         if cuda_tag:
             log_warn(
                 f"{cuda_tag} 以下の CUDA ビルドが見つからないため CPU 版を対象にします。",
                 f"No CUDA build at or below {cuda_tag}; targeting the CPU build instead.",
             )
-    elif cuda_tag and index_tag != cuda_tag:
+    elif cuda_tag and candidate_tags[0] != cuda_tag:
         log_warn(
-            f"{cuda_tag} 用のビルドが無いため {index_tag} を使用します。",
-            f"No {cuda_tag} build is published; using {index_tag} instead.",
+            f"{cuda_tag} 用のビルドが無いため {candidate_tags[0]} を使用します。",
+            f"No {cuda_tag} build is published; using {candidate_tags[0]} instead.",
         )
-
-    index_url = f"{TORCH_INDEX_ROOT}/{index_tag}"
-    log(f"  Index       : {index_url}")
 
     # torch は必ず対象。vision/audio は既に入っているものだけ追随させる。
     targets = [name for name in TORCH_PACKAGES if name == "torch" or env.installed.get(name)]
 
-    needs_update = False
-    unavailable: list[str] = []
-    for package in targets:
-        installed = env.installed.get(package)
-        try:
-            latest = fetch_latest_torch_version(index_tag, package, env)
-        except Exception as exc:
-            note = bi("最新版の確認に失敗", "version check failed")
-            log(f"  {package:<12}: {describe(installed)} ({note}: {exc})")
-            continue
+    attempt, first = resolve_index(env, targets, candidate_tags, use_fallback)
+    if attempt is None:
+        log("")
+        return []
 
-        if latest is None:
-            # このインデックスに存在しない以上、-U の対象には含められない。
-            note = bi(f"{index_tag} 用の配布なし", f"not published for {index_tag}")
-            log(f"  {package:<12}: {describe(installed)} ({note})")
-            unavailable.append(package)
-            continue
+    index_tag = attempt["index_tag"]
+    index_url = f"{TORCH_INDEX_ROOT}/{index_tag}"
+    chosen, pinning = select_wheels(attempt, targets)
 
-        if installed is None:
-            log(f"  {package:<12}: {describe(installed)} -> {latest}")
-            needs_update = True
-            continue
-
-        # PyPI 版はローカルタグを持たないので torch.version.cuda を代用する。
-        build = local_tag(installed) or (cuda_tag_from_version(env.torch_cuda) or "")
-        if version_key(installed) < version_key(latest):
-            note = bi("更新あり", "update available")
-            log(f"  {package:<12}: {installed} -> {latest} ({note})")
-            needs_update = True
-        elif build and build != index_tag:
-            note = bi("ビルド不一致", "build mismatch")
-            log(f"  {package:<12}: {installed} ({note}: {build} != {index_tag})")
-            needs_update = True
+    if index_tag != first["index_tag"]:
+        # torchaudio だけ古いインデックスに取り残される（ABI 不一致で import が
+        # 落ちる）のを避けるため、全部が揃うインデックスまで下げる。
+        blocked = [
+            name
+            for name in targets
+            if name in TORCH_ALIGNED_PACKAGES and not merged_entries(first["pools"][name])
+        ]
+        if blocked:
+            missing = "/".join(blocked)
+            log_warn(
+                f"{first['index_tag']} には {missing} の wheel がありません。",
+                f"No {missing} wheel is published for {first['index_tag']}.",
+            )
         else:
-            log(f"  {package:<12}: {installed} ({bi('最新', 'up to date')})")
+            log_warn(
+                f"{first['index_tag']} では torch と torchaudio のバージョンが揃いません。",
+                f"torch and torchaudio cannot be matched on {first['index_tag']}.",
+            )
+        log_lines(
+            f"バージョンまで揃う最新の組み合わせは {index_tag} の {attempt['release']} 系です。",
+            f"The newest matching set is {attempt['release']} on {index_tag}.",
+            indent="      ",
+        )
+    elif pinning:
+        # 同じインデックス内でも torchaudio の方が先に打ち止めになることがある
+        # （公式の Windows 版 torchaudio は 2.11.0 で止まっている）。
+        capped = []
+        for package in targets:
+            if package == "torch" or package not in TORCH_ALIGNED_PACKAGES:
+                continue
+            pool = attempt["pools"][package]
+            newest = latest_entry(pool["index"] + pool["fallback"])
+            if newest is not None and base_version(newest["version"]) == attempt["release"]:
+                capped.append(package)
+        holder = "/".join(capped) or "torchaudio"
+        log_warn(
+            f"{holder} は {attempt['release']} までしか配布されていないため、全体を "
+            f"{attempt['release']} 系に揃えます。",
+            f"{holder} is published only up to {attempt['release']}, so the whole set is "
+            f"held at {attempt['release']}.",
+        )
 
-    if not needs_update and not force:
+    log(f"  Index       : {index_url}")
+
+    needs_update = False
+    for package in targets:
+        pool = attempt["pools"][package]
+        if pool["error"]:
+            note = bi("最新版の確認に失敗", "version check failed")
+            log(f"  {package:<12}: {describe(env.installed.get(package))} ({note}: {pool['error']})")
+            continue
+        if pinning and package == "torchvision" and chosen.get(package) is None:
+            # メタデータから対応版を特定できなかった場合。torchvision は torch== を
+            # 宣言しているので、名前だけ渡せば pip 側で辻褄を合わせられる。
+            note = bi("pip の依存解決に任せます", "left to pip's resolver")
+            log(f"  {package:<12}: {describe(env.installed.get(package))} -> ({note})")
+            needs_update = True
+            continue
+        if log_package(env, package, chosen.get(package)):
+            needs_update = True
+
+    for package in targets:
+        entry = chosen.get(package)
+        if entry is None or entry.get("source") != "fallback":
+            continue
+        log(f"  [{bi('代替', 'fallback')}] {package} <- huggingface.co/{entry['repo']}")
+        log_lines(
+            "非公式のコミュニティビルドです。内容を確認のうえ自己責任で導入してください。",
+            "This is an unofficial community build; review it and install at your own risk.",
+            indent="      ",
+        )
+
+    missing = [
+        name
+        for name in targets
+        if chosen.get(name) is None
+        and not attempt["pools"][name]["error"]
+        and not (pinning and name == "torchvision")
+    ]
+    if missing:
+        log_warn(
+            f"{index_tag} で導入できないパッケージがあります: {'/'.join(missing)}",
+            f"Some packages cannot be installed from {index_tag}: {'/'.join(missing)}",
+        )
+
+    commands = build_torch_commands(env, targets, chosen, pinning, index_url)
+
+    if not commands:
         log_summary(
             "更新はありません。最新版が導入済みです。",
             "No update needed; the latest build is already installed.",
@@ -479,7 +815,14 @@ def plan_torch(env: Environment, cuda_tag: str | None, force: bool) -> list[str]
         log("")
         return []
 
-    if force and not needs_update:
+    if not needs_update:
+        if not force:
+            log_summary(
+                "更新はありません。最新版が導入済みです。",
+                "No update needed; the latest build is already installed.",
+            )
+            log("")
+            return []
         log_summary(
             "更新は不要ですが --force が指定されたためコマンドを出力します。",
             "Already current, but --force was given, so a command is printed anyway.",
@@ -487,21 +830,41 @@ def plan_torch(env: Environment, cuda_tag: str | None, force: bool) -> list[str]
     else:
         log_summary("更新が必要です。", "An update is required.")
 
-    installable = [package for package in targets if package not in unavailable]
-    if not installable:
-        log_warn(
-            f"{index_tag} 用に導入できるパッケージがありません。",
-            f"No package can be installed from the {index_tag} index.",
-        )
-        log("")
-        return []
-
-    command = (
-        f"{quote(env.executable)} -m pip install -U "
-        f"{' '.join(installable)} --index-url {index_url}"
-    )
     log("")
-    return [command]
+    return commands
+
+
+def build_torch_commands(
+    env: Environment, targets: list[str], chosen: dict, pinning: bool, index_url: str
+) -> list[str]:
+    specs = []
+    fallback_commands = []
+    for package in TORCH_PACKAGES:
+        if package not in targets:
+            continue
+        entry = chosen.get(package)
+        if entry is None:
+            # ピン留め中に torchvision を特定できなかった場合だけ、名前だけ渡して
+            # pip の依存解決に任せる（torchvision は torch== を宣言している）。
+            if pinning and package == "torchvision":
+                specs.append(package)
+            continue
+        if entry.get("source") == "fallback":
+            # 現行ビルドは依存を宣言していないが、将来 torch== 付きの版が来ても CUDA 版
+            # torch を PyPI 版で上書きされないよう --no-deps を付けておく。
+            fallback_commands.append(
+                f"{quote(env.executable)} -m pip install -U --no-deps --force-reinstall "
+                f"--no-cache-dir {quote(entry['url'])}"
+            )
+            continue
+        specs.append(quote(f"{package}=={entry['version']}") if pinning else package)
+
+    commands = []
+    if specs:
+        commands.append(
+            f"{quote(env.executable)} -m pip install -U {' '.join(specs)} --index-url {index_url}"
+        )
+    return commands + fallback_commands
 
 
 def plan_llama(env: Environment, cuda_tag: str | None, repo: str, per_page: int, force: bool) -> list[str]:
@@ -649,6 +1012,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="PyTorch のチェックを行いません。 / Skip the PyTorch check.",
     )
     parser.add_argument(
+        "--no-fallback",
+        action="store_true",
+        help="公式インデックスに wheel が無い場合でも Hugging Face の非公式ビルドを使いません"
+             "（例: cu132 + Windows の torchaudio）。この場合は全パッケージが同一リリースで"
+             "揃う下位の CUDA インデックスに切り替わります。"
+             " / Do not use third-party Hugging Face builds when the official index "
+             "publishes no wheel (e.g. torchaudio on cu132 + Windows); the plan then "
+             "steps down to a CUDA index where every package matches.",
+    )
+    parser.add_argument(
         "--no-llama",
         action="store_true",
         help="llama-cpp-python のチェックを行いません。 / Skip the llama-cpp-python check.",
@@ -721,7 +1094,7 @@ def main(argv=None) -> int:
 
     commands: list[str] = []
     if not args.no_torch:
-        commands += plan_torch(env, cuda_tag, args.force)
+        commands += plan_torch(env, cuda_tag, args.force, not args.no_fallback)
     if not args.no_llama:
         commands += plan_llama(env, cuda_tag, args.repo, args.search_limit, args.force)
 

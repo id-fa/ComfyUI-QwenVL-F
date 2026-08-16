@@ -16,7 +16,14 @@ pip install -r requirements.txt
 
 `tools/install_helper.py` は CUDA 版 PyTorch と JamePeng fork の `llama-cpp-python` wheel を対象に、
 「今の環境に必要な pip コマンド」を出力する CLI（`--python` で ComfyUI portable の python.exe を指定可能、
-`--run` で実行、最新導入済みならその旨を表示）。ルート直下の `.py` は `__init__.py` に全て import されるため
+`--run` で実行、最新導入済みならその旨を表示）。torch / torchvision / torchaudio は**常に同一リリースで
+揃う組み合わせ**として計画する（`TORCH_ALIGNED_PACKAGES`）。公式インデックスに wheel が無い組み合わせ
+（現状 cu132 + Windows の `torchaudio`）は `FALLBACK_WHEEL_SOURCES` の Hugging Face 非公式ビルドで代替し、
+`--no-fallback` 指定時や代替 wheel も無い場合は全部が揃う下位の CUDA インデックスまで下げる
+（例: cu132 → cu130 の 2.11.0 系。公式の Windows 版 torchaudio は 2.11.0 で配布終了しているため）。
+最新を入れられない場合は `==` ピン付きコマンドを出す（`-U` だけでは pip がダウングレードしないため）。
+torchvision は torch と番号体系が違うので、PEP 658 の `.metadata` から `Requires-Dist: torch (==X)` を
+読んで対応版を特定する（`resolve_companion`）。ルート直下の `.py` は `__init__.py` に全て import されるため
 `tools/` 配下に置いてある。
 
 No test suite or linter is configured. Publishing to the ComfyUI registry is handled automatically via `.github/workflows/publish.yml` when `pyproject.toml` changes on main.
