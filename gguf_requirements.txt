@@ -13,7 +13,12 @@
 #
 # Supported chat handlers (auto-selected by model filename):
 #   - Qwen3VLChatHandler / Qwen25VLChatHandler  -> Qwen-VL GGUFs
+#   - Qwen35ChatHandler                         -> Qwen3.5 / Qwen3.6 GGUFs
+#   - GenericMTMDChatHandler                    -> Qwen3.8 GGUFs (model's own chat template)
 #   - Gemma4ChatHandler                         -> Gemma 4 GGUFs
+#
+# MTP speculative decoding (mtp_draft_tokens widget) needs llama_cpp.llama_speculative,
+# added in the JamePeng fork v0.3.48. Older wheels warn and decode normally.
 #
 # Gemma 4 support requires the JamePeng fork of llama-cpp-python v0.3.35 or later.
 # See the install guide above (docs/LLAMA_CPP_PYTHON_VISION_INSTALL.md) for the

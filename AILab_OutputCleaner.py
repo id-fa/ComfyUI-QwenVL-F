@@ -62,7 +62,12 @@ def clean_model_output(text: str, config: OutputCleanConfig | None = None) -> st
 
     if cfg.strip_think:
         cleaned = _THINK_BLOCK_RE.sub("", cleaned)
-        cleaned = _THINK_CLOSE_RE.sub("", cleaned)
+        # A closing tag with no opener means the template opened <think> in the
+        # prompt itself (Qwen3.5 / 3.6 / 3.8 prefill it), so the reply starts
+        # inside the reasoning block: drop everything up to the last closer.
+        closers = list(_THINK_CLOSE_RE.finditer(cleaned))
+        if closers:
+            cleaned = cleaned[closers[-1].end():]
         if _THINK_OPEN_RE.search(cleaned):
             # Unclosed <think> — remove the tag and everything after it
             # (happens when max_tokens cuts off mid-thought)

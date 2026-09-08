@@ -14,7 +14,6 @@
 import base64
 import gc
 import io
-import inspect
 import json
 import time
 from dataclasses import dataclass
@@ -26,6 +25,7 @@ from PIL import Image
 
 from AILab_OutputCleaner import OutputCleanConfig, clean_model_output
 import AILab_ModelScan as model_scan
+import AILab_LlamaCppCompat as llama_compat
 
 NODE_DIR = Path(__file__).parent
 CONFIG_PATH = NODE_DIR / "hf_models.json"
@@ -70,6 +70,12 @@ MMPROJ_AUTO = "auto"
 TOOLTIPS = {
     "model_name": "Pick a .gguf already present under models/text_encoders or models/LLM. Nothing is downloaded automatically — copy the file in yourself, then reload ComfyUI.",
     "mmproj_name": "Vision projector to pair with the model. auto picks the first *mmproj*.gguf sitting next to it.",
+    "mtp_draft_tokens": (
+        "Multi-token prediction (speculative decoding) from the NextN/MTP heads inside the GGUF — "
+        "Qwen3.5 / 3.6 / 3.8 MTP builds. 0 disables it, 2 is a good starting point. "
+        "Needs llama-cpp-python v0.3.48+ and is ignored while a vision (mmproj) handler is loaded, "
+        "because MTP is text-only."
+    ),
 }
 
 
@@ -92,11 +98,6 @@ LOCAL_GGUF_MODELS: dict[str, Path] = {}
 LOCAL_MMPROJ_FILES: dict[str, Path] = {}
 
 
-def _is_gemma_model_name(name: str) -> bool:
-    """Detect Gemma models by filename substring (covers relative paths)."""
-    return "gemma" in (name or "").lower()
-
-
 def refresh_local_gguf():
     """Re-scan the base dirs. Called from INPUT_TYPES so new files show up on reload."""
     global LOCAL_GGUF_MODELS, LOCAL_MMPROJ_FILES
@@ -117,21 +118,7 @@ def list_mmproj_names() -> list[str]:
 refresh_local_gguf()
 
 
-def _filter_kwargs_for_callable(fn, kwargs: dict) -> dict:
-    try:
-        sig = inspect.signature(fn)
-    except Exception:
-        return dict(kwargs)
-
-    params = list(sig.parameters.values())
-    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params):
-        return dict(kwargs)
-
-    allowed: set[str] = set()
-    for p in params:
-        if p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY):
-            allowed.add(p.name)
-    return {k: v for k, v in kwargs.items() if k in allowed}
+_filter_kwargs_for_callable = llama_compat.filter_kwargs_for_callable
 
 
 import math
@@ -248,12 +235,17 @@ class QwenVLGGUFBase:
         self.chat_handler = None
         self.current_signature = None
         self._is_gemma = False
+        self._family = llama_compat.FAMILY_QWEN_VL
+        self._thinking_handled = False
 
     def clear(self):
+        llama_compat.close_llama(self.llm)
         self.llm = None
         self.chat_handler = None
         self.current_signature = None
         self._is_gemma = False
+        self._family = llama_compat.FAMILY_QWEN_VL
+        self._thinking_handled = False
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -279,6 +271,7 @@ class QwenVLGGUFBase:
         pool_size: int | None,
         enable_thinking: bool = False,
         mmproj_name: str = MMPROJ_AUTO,
+        mtp_draft_tokens: int = 0,
     ):
         self._load_backend()
 
@@ -302,8 +295,12 @@ class QwenVLGGUFBase:
         img_min = int(image_min_tokens) if image_min_tokens is not None else resolved.image_min_tokens
 
         has_mmproj = mmproj_path is not None and mmproj_path.exists()
-        is_gemma = _is_gemma_model_name(model_path.name) or _is_gemma_model_name(model_name)
+        family = llama_compat.detect_model_family(model_path.name, model_name)
+        is_gemma = family == llama_compat.FAMILY_GEMMA
+        mtp_tokens = max(int(mtp_draft_tokens or 0), 0)
 
+        # enable_thinking is baked into the chat handler for the families that
+        # expose it as a template flag, so flipping the toggle has to reload.
         signature = (
             str(model_path),
             str(mmproj_path) if has_mmproj else "",
@@ -314,6 +311,8 @@ class QwenVLGGUFBase:
             img_min,
             top_k_val,
             pool_size_val,
+            bool(enable_thinking),
+            mtp_tokens,
         )
         if self.llm is not None and self.current_signature == signature:
             return
@@ -323,50 +322,26 @@ class QwenVLGGUFBase:
         from llama_cpp import Llama
 
         self.chat_handler = None
+        thinking_handled = False
         if has_mmproj:
-            handler_cls = None
-            if is_gemma:
-                try:
-                    from llama_cpp.llama_chat_format import Gemma4ChatHandler
-
-                    handler_cls = Gemma4ChatHandler
-                except ImportError:
-                    raise RuntimeError(
-                        "[QwenVL] Gemma 4 requires llama-cpp-python v0.3.35+ with Gemma4ChatHandler "
-                        "(JamePeng fork). Update your llama_cpp install. See docs/GGUF_MANUAL_INSTALL.md"
-                    )
-            else:
-                try:
-                    from llama_cpp.llama_chat_format import Qwen3VLChatHandler
-
-                    handler_cls = Qwen3VLChatHandler
-                except ImportError:
-                    try:
-                        from llama_cpp.llama_chat_format import Qwen25VLChatHandler
-
-                        handler_cls = Qwen25VLChatHandler
-                    except ImportError:
-                        raise RuntimeError(
-                            "[QwenVL] Missing Qwen VL chat handler in llama_cpp. Install the correct fork/wheel. See docs/GGUF_MANUAL_INSTALL.md"
-                        )
-
-            # Build handler kwargs per family. Gemma4ChatHandler validates kwargs in
-            # its parent __init__ at runtime (not via signature), so _filter_kwargs_for_callable
-            # cannot protect us — pass only keys we know each handler accepts.
-            mmproj_kwargs = {
-                "clip_model_path": str(mmproj_path),
-                "image_max_tokens": img_max,
-                "verbose": False,
-            }
-            if not is_gemma:
-                mmproj_kwargs["force_reasoning"] = False
-            mmproj_kwargs = _filter_kwargs_for_callable(getattr(handler_cls, "__init__", handler_cls), mmproj_kwargs)
-            if "image_max_tokens" not in mmproj_kwargs:
+            # Handler choice follows the model family: Gemma 4, Qwen3.5/3.6
+            # (Qwen35ChatHandler) and Qwen3.8 (template-driven GenericMTMDChatHandler)
+            # each need their own kwargs, and every MTMD handler rejects unknown
+            # keys at runtime — see AILab_LlamaCppCompat.
+            build = llama_compat.build_chat_handler(
+                family,
+                mmproj_path,
+                image_max_tokens=img_max,
+                enable_thinking=enable_thinking,
+            )
+            self.chat_handler = build.handler
+            thinking_handled = build.thinking_handled
+            print(f"[QwenVL] Chat handler: {build.name} (family={family})")
+            if not build.image_tokens_handled:
                 print(
                     "[QwenVL] Warning: installed llama_cpp chat handler does not support image_max_tokens; "
                     "image token budget will be controlled by ctx only."
                 )
-            self.chat_handler = handler_cls(**mmproj_kwargs)
 
         llm_kwargs = {
             "model_path": str(model_path),
@@ -383,6 +358,22 @@ class QwenVLGGUFBase:
             llm_kwargs["image_min_tokens"] = img_min
             llm_kwargs["image_max_tokens"] = img_max
 
+        # MTP speculative decoding drafts from the NextN heads baked into the
+        # GGUF (Qwen3.5 / 3.6 / 3.8 MTP builds). llama-cpp-python only runs it on
+        # text batches, so it is skipped whenever a vision handler is attached.
+        spec_config = None
+        if mtp_tokens > 0:
+            if self.chat_handler is not None:
+                print(
+                    "[QwenVL] MTP speculative decoding is text-only in llama-cpp-python; "
+                    "skipping it because a vision (mmproj) chat handler is loaded."
+                )
+            else:
+                spec_config = llama_compat.build_spec_config(mtp_tokens)
+                if spec_config is not None:
+                    llm_kwargs["speculative"] = spec_config
+                    print(f"[QwenVL] MTP speculative decoding enabled (draft_n_max={mtp_tokens})")
+
         print(f"[QwenVL] Loading GGUF: {model_path.name} (device={device_kind}, gpu_layers={n_gpu_layers}, ctx={n_ctx})")
         llm_kwargs_filtered = _filter_kwargs_for_callable(getattr(Llama, "__init__", Llama), llm_kwargs)
         if has_mmproj and self.chat_handler is not None and "chat_handler" not in llm_kwargs_filtered:
@@ -394,10 +385,25 @@ class QwenVLGGUFBase:
             print("[QwenVL] Warning: device=cuda selected but n_gpu_layers=0; model will run on CPU.")
         try:
             self.llm = Llama(**llm_kwargs_filtered)
-        except Exception:
-            self.chat_handler = None
-            raise
+        except Exception as exc:
+            if spec_config is None:
+                self.chat_handler = None
+                raise
+            # A GGUF without NextN/MTP tensors fails to build the draft context;
+            # ordinary decoding still works, so retry once without it.
+            print(
+                f"[QwenVL] Loading with MTP failed ({exc}); retrying without speculative decoding. "
+                "The GGUF may not carry NextN/MTP tensors — use an MTP build of the model."
+            )
+            llm_kwargs_filtered.pop("speculative", None)
+            try:
+                self.llm = Llama(**llm_kwargs_filtered)
+            except Exception:
+                self.chat_handler = None
+                raise
         self._is_gemma = is_gemma
+        self._family = family
+        self._thinking_handled = thinking_handled
         self.current_signature = signature
 
     def _invoke(
@@ -411,6 +417,7 @@ class QwenVLGGUFBase:
         repetition_penalty: float,
         seed: int,
         stop_words: list[str] | None = None,
+        enable_thinking: bool = False,
     ) -> str:
         if images_b64:
             content = [{"type": "text", "text": user_prompt}]
@@ -433,16 +440,27 @@ class QwenVLGGUFBase:
         else:
             default_stop = ["<|im_end|>", "<|im_start|>"]
 
+        call_kwargs = {
+            "messages": messages,
+            "max_tokens": int(max_tokens),
+            "temperature": float(temperature),
+            "top_p": float(top_p),
+            "repeat_penalty": float(repetition_penalty),
+            "seed": int(seed),
+            "stop": default_stop + (stop_words or []),
+        }
+        # Qwen3.5/3.6/3.8 templates open <think> in the prompt itself. When no
+        # chat handler owns the enable_thinking flag (text-only run, or an older
+        # wheel), close the block with the reasoning budget sampler instead.
+        if not self._thinking_handled and self._family in (
+            llama_compat.FAMILY_QWEN35,
+            llama_compat.FAMILY_QWEN38,
+        ):
+            call_kwargs.update(llama_compat.text_reasoning_kwargs(self._family, enable_thinking))
+        call_kwargs = _filter_kwargs_for_callable(self.llm.create_chat_completion, call_kwargs)
+
         start = time.perf_counter()
-        result = self.llm.create_chat_completion(
-            messages=messages,
-            max_tokens=int(max_tokens),
-            temperature=float(temperature),
-            top_p=float(top_p),
-            repeat_penalty=float(repetition_penalty),
-            seed=int(seed),
-            stop=default_stop + (stop_words or []),
-        )
+        result = self.llm.create_chat_completion(**call_kwargs)
         elapsed = max(time.perf_counter() - start, 1e-6)
 
         usage = result.get("usage") or {}
@@ -489,6 +507,7 @@ class QwenVLGGUFBase:
         image2=None,
         image3=None,
         mmproj_name: str = MMPROJ_AUTO,
+        mtp_draft_tokens: int = 0,
     ):
         torch.manual_seed(int(seed))
 
@@ -496,11 +515,8 @@ class QwenVLGGUFBase:
         if custom_prompt and custom_prompt.strip():
             prompt = custom_prompt.strip()
 
-        is_gemma = _is_gemma_model_name(model_name)
-        if not is_gemma:
-            # Qwen uses inline /think /no_think tokens; Gemma 4 uses the handler's enable_thinking flag.
-            think_prefix = "/think" if enable_thinking else "/no_think"
-            prompt = f"{think_prefix}\n{prompt}"
+        family = llama_compat.detect_model_family(model_name)
+        is_gemma = family == llama_compat.FAMILY_GEMMA
 
         # Collect all PIL images first (static images + video frames)
         pil_images: list[Image.Image] = []
@@ -542,9 +558,16 @@ class QwenVLGGUFBase:
                 pool_size=pool_size,
                 enable_thinking=enable_thinking,
                 mmproj_name=mmproj_name,
+                mtp_draft_tokens=mtp_draft_tokens,
             )
             if images_b64 and self.chat_handler is None:
                 print("[QwenVL] Warning: images provided but this model entry has no mmproj_file; images will be ignored")
+            if not self._thinking_handled and self._family == llama_compat.FAMILY_QWEN_VL:
+                # Qwen2.5-VL / Qwen3-VL read inline /think, /no_think tokens. The
+                # newer families steer thinking through the handler or the
+                # reasoning budget instead (see _invoke).
+                think_prefix = "/think" if enable_thinking else "/no_think"
+                prompt = f"{think_prefix}\n{prompt}"
             text = self._invoke(
                 system_prompt="You are a helpful vision-language assistant.",
                 user_prompt=prompt,
@@ -555,6 +578,7 @@ class QwenVLGGUFBase:
                 repetition_penalty=repetition_penalty,
                 seed=seed,
                 stop_words=stop_words,
+                enable_thinking=enable_thinking,
             )
             return (text,)
         finally:
@@ -665,6 +689,7 @@ class AILab_QwenVL_GGUF_Advanced(QwenVLGGUFBase):
                 "top_k": ("INT", {"default": 0, "min": 0, "max": 32768}),
                 "pool_size": ("INT", {"default": 4194304, "min": 1048576, "max": 10485760, "step": 524288}),
                 "enable_thinking": ("BOOLEAN", {"default": False}),
+                "mtp_draft_tokens": ("INT", {"default": 0, "min": 0, "max": 8, "tooltip": TOOLTIPS["mtp_draft_tokens"]}),
                 "stop_words": ("STRING", {"default": ""}),
                 "keep_model_loaded": ("BOOLEAN", {"default": True}),
                 "seed": ("INT", {"default": 1, "min": 1, "max": 2**32 - 1}),
@@ -702,6 +727,7 @@ class AILab_QwenVL_GGUF_Advanced(QwenVLGGUFBase):
         top_k,
         pool_size,
         enable_thinking,
+        mtp_draft_tokens,
         stop_words,
         keep_model_loaded,
         seed,
@@ -737,6 +763,7 @@ class AILab_QwenVL_GGUF_Advanced(QwenVLGGUFBase):
             image2=image2,
             image3=image3,
             mmproj_name=mmproj_name,
+            mtp_draft_tokens=mtp_draft_tokens,
         )
 
 

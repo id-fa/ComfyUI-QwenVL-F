@@ -23,6 +23,7 @@ from llama_cpp import Llama
 
 from AILab_OutputCleaner import OutputCleanConfig, clean_model_output
 import AILab_ModelScan as model_scan
+import AILab_LlamaCppCompat as llama_compat
 
 NODE_DIR = Path(__file__).parent
 GGUF_CONFIG_PATH = NODE_DIR / "gguf_models.json"
@@ -53,11 +54,6 @@ GGUF_BASE_DIRS: list[str] = model_scan.read_base_dirs(GGUF_CONFIG_PATH)
 LOCAL_GGUF_MODELS: dict[str, Path] = {}
 
 
-def _is_gemma_model_name(name: str) -> bool:
-    """Detect Gemma models by filename substring (covers relative paths)."""
-    return "gemma" in (name or "").lower()
-
-
 def refresh_local_gguf() -> dict[str, Path]:
     """Re-scan the base dirs. Called from INPUT_TYPES so new files show up on reload."""
     global LOCAL_GGUF_MODELS
@@ -79,6 +75,7 @@ class AILab_QwenVL_GGUF_PromptEnhancer:
         self.llm = None
         self.current_signature = None
         self.styles = STYLES
+        self._family = llama_compat.FAMILY_QWEN_VL
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -98,6 +95,8 @@ class AILab_QwenVL_GGUF_PromptEnhancer:
                 "top_p": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 1.0}),
                 "repetition_penalty": ("FLOAT", {"default": 1.1, "min": 0.5, "max": 2.0}),
                 "ctx": ("INT", {"default": 8192, "min": 1024, "max": 262144, "step": 512, "tooltip": "Context length passed to llama.cpp."}),
+                "enable_thinking": ("BOOLEAN", {"default": False, "tooltip": "Let a thinking model reason before answering. Off keeps the whole token budget for the prompt itself."}),
+                "mtp_draft_tokens": ("INT", {"default": 0, "min": 0, "max": 8, "tooltip": "Multi-token prediction (speculative decoding) from the NextN/MTP heads inside the GGUF — Qwen3.5 / 3.6 / 3.8 MTP builds. 0 disables it, 2 is a good starting point. Needs llama-cpp-python v0.3.48+."}),
                 "english_output": ("BOOLEAN", {"default": False, "tooltip": "Force final output in English using translation prompt."}),
                 "device": (["auto", "cuda", "cpu", "mps"], {"default": "auto", "tooltip": "Select device; auto prefers GPU when available."}),
                 "keep_model_loaded": ("BOOLEAN", {"default": True, "tooltip": "Keep the model in memory after execution. Disable to free VRAM."}),
@@ -106,8 +105,10 @@ class AILab_QwenVL_GGUF_PromptEnhancer:
         }
 
     def clear(self):
+        llama_compat.close_llama(self.llm)
         self.llm = None
         self.current_signature = None
+        self._family = llama_compat.FAMILY_QWEN_VL
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -122,10 +123,12 @@ class AILab_QwenVL_GGUF_PromptEnhancer:
             )
         return resolved
 
-    def _load_model(self, model_name, device, context_length):
+    def _load_model(self, model_name, device, context_length, mtp_draft_tokens=0):
         resolved = self._resolve_model_path(model_name)
         context_length = int(context_length)
-        signature = (resolved, context_length, device)
+        mtp_tokens = max(int(mtp_draft_tokens or 0), 0)
+        family = llama_compat.detect_model_family(resolved.name, model_name)
+        signature = (resolved, context_length, device, mtp_tokens)
         if self.llm is not None and self.current_signature == signature:
             return
         self.clear()
@@ -146,11 +149,32 @@ class AILab_QwenVL_GGUF_PromptEnhancer:
             "n_batch": 1024,
             "verbose": False,
         }
-        # Qwen text-only GGUFs need an explicit chat_format. Gemma ships its own
-        # chat template inside the GGUF, so let llama_cpp pick it up automatically.
-        if not _is_gemma_model_name(model_name):
+        # Qwen2.5 / Qwen3 text-only GGUFs need an explicit chat_format. Gemma 4 and
+        # Qwen3.5 / 3.6 / 3.8 ship their own chat template (with reasoning switches
+        # the "qwen" ChatML format does not model), so let llama_cpp read it.
+        if family == llama_compat.FAMILY_QWEN_VL:
             kwargs["chat_format"] = "qwen"
-        self.llm = Llama(**kwargs)
+
+        # Multi-token prediction drafts from the NextN/MTP heads inside the GGUF.
+        # This node is text-only, which is exactly what llama-cpp-python supports.
+        spec_config = llama_compat.build_spec_config(mtp_tokens)
+        if spec_config is not None:
+            kwargs["speculative"] = spec_config
+            print(f"[QwenVL] MTP speculative decoding enabled (draft_n_max={mtp_tokens})")
+
+        try:
+            self.llm = Llama(**kwargs)
+        except Exception as exc:
+            if spec_config is None:
+                raise
+            # A GGUF without NextN/MTP tensors cannot build the draft context.
+            print(
+                f"[QwenVL] Loading with MTP failed ({exc}); retrying without speculative decoding. "
+                "The GGUF may not carry NextN/MTP tensors — use an MTP build of the model."
+            )
+            kwargs.pop("speculative", None)
+            self.llm = Llama(**kwargs)
+        self._family = family
         self.current_signature = signature
 
     def _invoke_llama(
@@ -162,6 +186,7 @@ class AILab_QwenVL_GGUF_PromptEnhancer:
         top_p,
         repetition_penalty,
         seed,
+        enable_thinking=False,
     ):
         def _looks_like_planning(text: str) -> bool:
             if not text:
@@ -175,17 +200,24 @@ class AILab_QwenVL_GGUF_PromptEnhancer:
             )
 
         def _call(system: str, user: str, temp: float, seed_val: int) -> str:
-            response = self.llm.create_chat_completion(
-                messages=[
+            call_kwargs = {
+                "messages": [
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},
                 ],
-                max_tokens=max_tokens,
-                temperature=temp,
-                top_p=top_p,
-                repeat_penalty=repetition_penalty,
-                seed=seed_val,
+                "max_tokens": max_tokens,
+                "temperature": temp,
+                "top_p": top_p,
+                "repeat_penalty": repetition_penalty,
+                "seed": seed_val,
+            }
+            # Thinking models would spend the whole (small) token budget on
+            # reasoning. The budget sampler closes the block as it opens.
+            call_kwargs.update(llama_compat.text_reasoning_kwargs(self._family, enable_thinking))
+            call_kwargs = llama_compat.filter_kwargs_for_callable(
+                self.llm.create_chat_completion, call_kwargs
             )
+            response = self.llm.create_chat_completion(**call_kwargs)
             if not response or "choices" not in response or not response["choices"]:
                 raise RuntimeError("[QwenVL] llama_cpp returned empty response")
             return (response["choices"][0].get("message", {}).get("content", "") or "").strip()
@@ -224,6 +256,8 @@ class AILab_QwenVL_GGUF_PromptEnhancer:
         top_p,
         repetition_penalty,
         ctx,
+        enable_thinking,
+        mtp_draft_tokens,
         english_output,
         device,
         keep_model_loaded,
@@ -240,7 +274,7 @@ class AILab_QwenVL_GGUF_PromptEnhancer:
         )
         user_prompt = prompt_text.strip() or "Describe a scene vividly."
         merged_prompt = user_prompt
-        self._load_model(model_name, device, ctx)
+        self._load_model(model_name, device, ctx, mtp_draft_tokens)
         enhanced = self._invoke_llama(
             system_prompt=system_prompt,
             user_prompt=merged_prompt,
@@ -249,6 +283,7 @@ class AILab_QwenVL_GGUF_PromptEnhancer:
             top_p=top_p,
             repetition_penalty=repetition_penalty,
             seed=seed,
+            enable_thinking=enable_thinking,
         )
         if english_output:
             translated = self._invoke_llama(
@@ -263,6 +298,7 @@ class AILab_QwenVL_GGUF_PromptEnhancer:
                 top_p=0.95,
                 repetition_penalty=1.05,
                 seed=seed + 1,
+                enable_thinking=enable_thinking,
             )
             final = clean_model_output(translated, OutputCleanConfig(mode="prompt")) or translated.strip()
         else:

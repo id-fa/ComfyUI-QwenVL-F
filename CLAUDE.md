@@ -45,11 +45,16 @@ No test suite or linter is configured. Publishing to the ComfyUI registry is han
 - `QwenVLGGUFBase` — base class for llama-cpp-python models with output cleaning.
 - `AILab_QwenVL_GGUF` and `AILab_QwenVL_GGUF_Advanced` inherit from it.
 - Advancedノードは `image`, `image2`, `image3` の3つのoptional画像入力を持ち、複数画像の同時参照が可能。Simpleノードは `image` のみ。
-- **Chat handler自動選択**: モデル名（`base_dir` からの相対パス）に `gemma` が含まれる場合は `Gemma4ChatHandler` を使用（JamePeng fork v0.3.35+ 必須）。それ以外は `Qwen3VLChatHandler` → `Qwen25VLChatHandler` の順でフォールバック。判定は `_is_gemma_model_name()` によるファイル名部分一致。
+- **Chat handler自動選択**: `AILab_LlamaCppCompat.detect_model_family()` がファイル名（`base_dirs` からの相対パス）からファミリを判定し、`build_chat_handler()` がハンドラを構築する。対応は JamePeng fork README のモデル/ハンドラ表に準拠：
+  - `gemma` を含む → `Gemma4ChatHandler`（v0.3.35+ 必須）
+  - `Qwen3.5` / `Qwen3.6` → `Qwen35ChatHandler`（無ければ `Qwen3VLChatHandler` → `Qwen25VLChatHandler` にフォールバック）
+  - `Qwen3.8` → `GenericMTMDChatHandler`（GGUF 埋め込みの chat template を使う汎用ハンドラ。専用ハンドラは未提供）
+  - それ以外（Qwen2.5-VL / Qwen3-VL 等） → `Qwen3VLChatHandler` → `Qwen25VLChatHandler`
+  - バージョン判定の区切りは **ドットとアンダースコアのみ**（`Qwen3.6`, `Qwen3_5`）。ハイフンを許すと `Qwen3-8B`（Qwen3 の 8B）を Qwen3.8 と誤認するため。
 
 **Prompt enhancers** (text-only, no vision):
 - `AILab_QwenVL_PromptEnhancer.py` — Transformers-based。`keep_model_loaded` スイッチあり（HF text model用の `_invoke_text` パスと、VLモデル流用の `_invoke_qwen` パスの両方でアンロード対応）。
-- `AILab_QwenVL_GGUF_PromptEnhancer.py` — GGUF-based。`keep_model_loaded` スイッチあり（`process()` 完了後に `self.clear()` でアンロード）。モデル名に `gemma` を含む場合は `chat_format="qwen"` を渡さず、GGUFに埋め込まれた chat template を llama_cpp に使わせる（それ以外は従来通り `chat_format="qwen"` を強制）。
+- `AILab_QwenVL_GGUF_PromptEnhancer.py` — GGUF-based。`keep_model_loaded` スイッチあり（`process()` 完了後に `self.clear()` でアンロード）。`chat_format="qwen"` を強制するのは `FAMILY_QWEN_VL`（Qwen2.5 / Qwen3 系）のときだけで、Gemma 4 と Qwen3.5 / 3.6 / 3.8 は GGUF に埋め込まれた chat template を llama_cpp に使わせる（`enable_thinking` などの reasoning スイッチを旧 ChatML 形式が持たないため）。`enable_thinking` と `mtp_draft_tokens` ウィジェットあり。
 
 **Output cleaning** (`AILab_OutputCleaner.py`):
 - `OutputCleanConfig` dataclass and utilities to strip thinking tags and leaked tokens from model output.
@@ -57,6 +62,13 @@ No test suite or linter is configured. Publishing to the ComfyUI registry is han
 
 ### Key Subsystems
 
+- **llama-cpp-python 互換レイヤ** (`AILab_LlamaCppCompat.py`) — GGUF 2モジュールが共有する。fork のバージョン差を全部ここで吸収し、古いwheelでは例外ではなくコンソール警告に落とす：
+  - `detect_model_family()` / `is_gemma_family()` — ファイル名からファミリ判定（`FAMILY_GEMMA` / `FAMILY_QWEN35` / `FAMILY_QWEN38` / `FAMILY_QWEN_VL`）。
+  - `import_chat_handler()` — ハンドラは `llama_cpp.llama_multimodal` を優先し、旧 `llama_chat_format` にフォールバック（0.3.41以降で移動、旧パスは再エクスポートのみ）。
+  - `handler_accepts()` — **MTMD系ハンドラは全て `**kwargs` を持ち未知キーを実行時に `TypeError` で弾く**ため、`inspect.signature` の VAR_KEYWORD 判定では守れない。MRO を辿って実パラメータ名の有無を見る。
+  - `build_chat_handler()` — ファミリ別に受理されるkwargsだけを組み立てる。mmproj は `mmproj_path`（新）/ `clip_model_path`（旧）を自動選択。`enable_thinking` を受けるハンドラ（`Qwen35ChatHandler` / `Gemma4ChatHandler`）にはそれを渡し、`GenericMTMDChatHandler` には `extra_template_arguments={"enable_thinking": ...}`、`Qwen3VLChatHandler` には `force_reasoning=False` を渡す。
+  - `text_reasoning_kwargs()` — ハンドラ側にthinkingスイッチが無い経路（テキスト専用、または旧wheel）向け。`reasoning_budget=0` で thinking ブロックを開始直後に閉じさせる。Qwen3.5系はテンプレートが `<think>` をプロンプト側で開くので `reasoning_start_in_prompt=True` を併用。
+  - `build_spec_config()` — MTP用 `SpecConfig`。`close_llama()` — `Llama.close()`（draftコンテキストの解放を含む）。
 - **Attention resolution**: `resolve_attention_mode()` auto-selects SageAttention → Flash-Attn → SDPA with GPU architecture-aware kernel selection (`set_sage_attention`, `get_sage_attention_config`).
 - **Memory management**: `enforce_memory()` auto-downgrades quantization if VRAM is insufficient; `clear()` releases models and clears CUDA cache。各バックエンドでメモリリーク対策を実施済み：
   - **中間テンソル解放**: HF側 `generate()` と `_invoke_text()` で `processed`, `model_inputs`, `outputs`, `inputs` を使用後に `del`。
@@ -120,22 +132,36 @@ GGUF側の `run()` で、入力画像のトークン数が `ctx` 予算を超え
 
 ### Thinking モード制御
 
-全ノード（Simple/Advanced × HF/GGUF）に `enable_thinking` (BOOLEAN, default=False) ウィジェットがある。Qwen3-VL-*-Thinking モデル向け。
+全ノード（Simple/Advanced × HF/GGUF）と GGUF PromptEnhancer に `enable_thinking` (BOOLEAN, default=False) ウィジェットがある。Qwen3-VL-*-Thinking / Qwen3.5系 / Gemma 4 など reasoning を出すモデル向け。
 
 **HF Transformers側** (`AILab_QwenVL.py`):
 - `apply_chat_template` に `chat_template_kwargs={"enable_thinking": enable_thinking}` を渡す。テンプレート側が `enable_thinking=False` のとき `/no_think` トークンを自動挿入する。
 - `enable_thinking=None`（非Thinkingモデル）の場合は `chat_template_kwargs` 自体を送らず、テンプレート側のデフォルト動作に任せる。
 
-**GGUF側** (`AILab_QwenVL_GGUF.py`):
-- **Qwen系**: llama-cpp-python にはテンプレート制御フラグがないため、ユーザープロンプト先頭に `/think` または `/no_think` トークンを直接挿入する。ハンドラ init には `force_reasoning=False` を渡す。
-- **Gemma 4系**: プレフィックス注入はスキップし、`Gemma4ChatHandler` にも thinking 関連 kwargs を渡さない（`force_reasoning` / `enable_thinking` はフォーク側 v0.3.35 の実装で親クラスが `TypeError` を投げるため）。現状 `enable_thinking` トグルは Gemma 経路では無効。将来フォーク側が安定したkwarg名を公開したら追加予定。Gemma 4 のthinkingはフォーク側の仕様で 31B / 26BA4B バリアントのみ対応（E2B / E4B は非対応）。
+**GGUF側** (`AILab_QwenVL_GGUF.py` / `AILab_QwenVL_GGUF_PromptEnhancer.py`): ファミリごとに3経路（判定と kwargs 構築は `AILab_LlamaCppCompat`）。
+- **Qwen2.5-VL / Qwen3-VL**: テンプレート制御フラグが無いため、ユーザープロンプト先頭に `/think` または `/no_think` を挿入する（ハンドラ確定後に `run()` 内で付与）。ハンドラ init には `force_reasoning=False`。
+- **Qwen3.5 / 3.6（`Qwen35ChatHandler`）・Gemma 4（`Gemma4ChatHandler`）・Qwen3.8（`GenericMTMDChatHandler`）**: ハンドラ／テンプレート引数の `enable_thinking` で制御する（Gemma 4 も v0.3.35 以降は `enable_thinking` を受けるようになった）。この経路ではプレフィックス注入をしない。`enable_thinking` はハンドラ生成時に焼き込まれるため、**モデル署名（`current_signature`）に含めてトグル変更時にリロードさせる**。
+- **ハンドラを持たない経路**（mmproj 無しのテキスト実行、または旧wheelでフォールバックした場合）: `create_chat_completion(reasoning_budget=0, ...)` で thinking ブロックを開始直後に閉じる。Qwen3.5/3.6/3.8 はテンプレートがプロンプト側で `<think>` を開くので `reasoning_start_in_prompt=True` を併用する。
 
-> **注意**: `Gemma4ChatHandler.__init__` は `**kwargs` を受け取り親クラスで runtime 検証するため、`inspect.signature` ベースの `_filter_kwargs_for_callable` ではフィルタできない。ハンドラ毎に必要最小限の kwargs だけ明示的に構築すること。
+> **注意**: MTMD 系ハンドラの `__init__` は `**kwargs` を受け取り親クラスで runtime 検証するため、`inspect.signature` ベースのフィルタでは弾けない。`llama_compat.handler_accepts()`（MRO を辿る）で判定し、ハンドラ毎に必要最小限の kwargs だけ構築すること。
+> Gemma 4 のthinkingはフォーク側の仕様で 31B / 26BA4B バリアントのみ対応（E2B / E4B は非対応）。
 
 **出力側**（共通）:
 - `AILab_OutputCleaner.py` の `clean_model_output()` が `<think>...</think>` ブロック、不完全な `<think>` / `</think>` タグを正規表現で除去する。
 - 閉じタグのない `<think>`（`max_tokens` 不足で途中打ち切り時に発生）は `<think>` 以降のテキストをすべて除去する。
+- 開きタグの無い `</think>`（Qwen3.5/3.6/3.8 はテンプレートがプロンプト側で `<think>` を開くため、生成側は reasoning本文 + `</think>` + 回答 になる）は、**最後の `</think>` までを丸ごと削除する**（従来はタグだけ消していたので reasoning が本文に混ざっていた）。
 - **Gemma 4 チャンネル除去**: Gemma 4 は reasoning を `<|channel|>thought ... <|channel|>` で囲むため、`_GEMMA_CHANNEL_BLOCK_RE` でペアマッチしてブロックごと除去する。パイプの位置が揺れるレンダリング（`<|channel>`, `<channel|>`, `<|channel|>`）すべてにマッチ。ペア除去後に残った単独マーカーは、先頭にある場合は途中打ち切りの opener とみなして以降を全削除、そうでなければ closer とみなして最終マーカー以降のテキストを残す。`<|turn|>` / `<|start_of_turn|>` / `<|end_of_turn|>` 系リークトークンは `_GEMMA_TURN_TOKEN_RE` で個別に除去。
+
+### MTP（Multi-Token Prediction / 投機的デコード）
+
+`mtp_draft_tokens` (INT, default=0, 0=無効) ウィジェットが **GGUF Advanced VLノード** と **GGUF PromptEnhancer** にある。GGUF に埋め込まれた NextN/MTP ヘッド（Qwen3.5 / 3.6 / 3.8 の MTP ビルド）からドラフトトークンを生成する。
+
+- 実装は `llama_compat.build_spec_config()` → `Llama(speculative=SpecConfig(spec_type=DRAFT_MTP, draft_n_max=N))`。`draft_model_path` を渡さない場合、llama-cpp-python 側が `load_mtp=True` を自動で立てる（外部MTP sidecar GGUF は未対応）。
+- **llama-cpp-python v0.3.48+ 必須**（`llama_cpp.llama_speculative`）。無い場合は警告を出して通常デコードで続行する。
+- **MTP はテキスト専用**（fork のドキュメント上の制約）。そのため VLノードでは mmproj/vision ハンドラがロードされている間はスキップし、その旨をコンソールに出す。PromptEnhancer は常にテキスト専用なので無条件に有効。
+- MTPヘッドを持たない GGUF ではドラフトコンテキスト構築に失敗するため、**例外を捕捉して `speculative` 抜きで一度だけリトライ**する（普通のモデルを選んでもワークフローが壊れない）。
+- 推奨値は Qwen3.8 27B で `draft_n_max=2`（fork のベンチ結果）。GPU・量子化・プロンプトで最適値は変わる。生成が短いと verify のコスト負けする点も同じ。
+- `clear()` は `Llama.close()` を呼ぶ（draftコンテキストの native リソース解放のため）。
 
 ### Stop Words
 

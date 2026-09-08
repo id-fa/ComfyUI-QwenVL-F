@@ -2,9 +2,16 @@
 
 This plugin’s **QwenVL (GGUF)** vision nodes require a `llama-cpp-python` build that includes multimodal chat handlers such as:
 
-- `Qwen3VLChatHandler`
-- `Qwen25VLChatHandler`
+- `Qwen3VLChatHandler` (Qwen3-VL)
+- `Qwen25VLChatHandler` (Qwen2.5-VL)
+- `Qwen35ChatHandler` (Qwen3.5 and Qwen3.6 GGUF)
+- `GenericMTMDChatHandler` (Qwen3.8 GGUF — template-driven fallback that reads the chat template embedded in the model)
 - `Gemma4ChatHandler` (Gemma 4 GGUF, JamePeng fork v0.3.35 or later — see [discussion #109](https://github.com/JamePeng/llama-cpp-python/discussions/109))
+
+The nodes import handlers from `llama_cpp.llama_multimodal` first and fall back to
+the older `llama_chat_format` path, so both layouts work. MTP speculative decoding
+(the `mtp_draft_tokens` widget) additionally needs `llama_cpp.llama_speculative`,
+which arrived in **v0.3.48**; without it the nodes print a warning and decode normally.
 
 The upstream `llama-cpp-python` from PyPI often does **not** include these vision handlers. Use a fork/build that provides them (e.g. JamePeng’s fork) and install a **Release wheel**.
 
@@ -107,6 +114,13 @@ Notes:
 
 ```bat
 C:\AI\ComfyUI\python_embeded\python.exe -c "from llama_cpp.llama_chat_format import Qwen3VLChatHandler, Qwen25VLChatHandler; print('handlers OK')"
+```
+
+Newer families and MTP (only the wheels that ship them):
+
+```bat
+C:\AI\ComfyUI\python_embeded\python.exe -c "from llama_cpp.llama_multimodal import Qwen35ChatHandler, GenericMTMDChatHandler, Gemma4ChatHandler; print('new handlers OK')"
+C:\AI\ComfyUI\python_embeded\python.exe -c "from llama_cpp.llama_speculative import SpecConfig, SpeculativeType; print('MTP OK')"
 ```
 
 If this fails, you installed a wheel that does not include vision support (or installed into the wrong Python environment).
