@@ -603,8 +603,11 @@ class AILab_QwenVL_GGUF(QwenVLGGUFBase):
                 "custom_prompt": ("STRING", {"default": "", "multiline": True}),
                 "max_tokens": ("INT", {"default": 512, "min": 64, "max": 32768}),
                 "enable_thinking": ("BOOLEAN", {"default": False}),
-                "keep_model_loaded": ("BOOLEAN", {"default": True}),
+                "keep_model_loaded": ("BOOLEAN", {"default": False}),
                 "seed": ("INT", {"default": 1, "min": 1, "max": 2**32 - 1}),
+                # Appended last so widget order in workflows saved before this
+                # existed still lines up.
+                "mmproj_name": (list_mmproj_names(), {"default": MMPROJ_AUTO, "tooltip": TOOLTIPS["mmproj_name"]}),
             },
             "optional": {
                 "image": ("IMAGE",),
@@ -626,6 +629,7 @@ class AILab_QwenVL_GGUF(QwenVLGGUFBase):
         enable_thinking,
         keep_model_loaded,
         seed,
+        mmproj_name=MMPROJ_AUTO,
         image=None,
         video=None,
     ):
@@ -651,6 +655,7 @@ class AILab_QwenVL_GGUF(QwenVLGGUFBase):
             top_k=None,
             pool_size=None,
             enable_thinking=enable_thinking,
+            mmproj_name=mmproj_name,
         )
 
 
@@ -691,7 +696,7 @@ class AILab_QwenVL_GGUF_Advanced(QwenVLGGUFBase):
                 "enable_thinking": ("BOOLEAN", {"default": False}),
                 "mtp_draft_tokens": ("INT", {"default": 0, "min": 0, "max": 8, "tooltip": TOOLTIPS["mtp_draft_tokens"]}),
                 "stop_words": ("STRING", {"default": ""}),
-                "keep_model_loaded": ("BOOLEAN", {"default": True}),
+                "keep_model_loaded": ("BOOLEAN", {"default": False}),
                 "seed": ("INT", {"default": 1, "min": 1, "max": 2**32 - 1}),
             },
             "optional": {

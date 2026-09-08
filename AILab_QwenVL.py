@@ -860,7 +860,7 @@ class AILab_QwenVL(QwenVLBase):
                 "custom_prompt": ("STRING", {"default": "", "multiline": True, "tooltip": TOOLTIPS["custom_prompt"]}),
                 "max_tokens": ("INT", {"default": 512, "min": 64, "max": 32768, "tooltip": TOOLTIPS["max_tokens"]}),
                 "enable_thinking": ("BOOLEAN", {"default": False, "tooltip": TOOLTIPS["enable_thinking"]}),
-                "keep_model_loaded": ("BOOLEAN", {"default": True, "tooltip": TOOLTIPS["keep_model_loaded"]}),
+                "keep_model_loaded": ("BOOLEAN", {"default": False, "tooltip": TOOLTIPS["keep_model_loaded"]}),
                 "seed": ("INT", {"default": 1, "min": 1, "max": 2**32 - 1, "tooltip": TOOLTIPS["seed"]}),
             },
             "optional": {
@@ -907,7 +907,7 @@ class AILab_QwenVL_Advanced(QwenVLBase):
                 "frame_count": ("INT", {"default": 16, "min": 1, "max": 64, "tooltip": TOOLTIPS["frame_count"]}),
                 "enable_thinking": ("BOOLEAN", {"default": False, "tooltip": TOOLTIPS["enable_thinking"]}),
                 "stop_words": ("STRING", {"default": "", "tooltip": TOOLTIPS["stop_words"]}),
-                "keep_model_loaded": ("BOOLEAN", {"default": True, "tooltip": TOOLTIPS["keep_model_loaded"]}),
+                "keep_model_loaded": ("BOOLEAN", {"default": False, "tooltip": TOOLTIPS["keep_model_loaded"]}),
                 "seed": ("INT", {"default": 1, "min": 1, "max": 2**32 - 1, "tooltip": TOOLTIPS["seed"]}),
             },
             "optional": {

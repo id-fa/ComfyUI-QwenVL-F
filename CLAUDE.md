@@ -98,7 +98,7 @@ No test suite or linter is configured. Publishing to the ComfyUI registry is han
 **各ノードでのスキャン**:
 - スキャンは `INPUT_TYPES()` 呼び出しのたびに全ルートに対して実行される（`refresh_local_models()` / `refresh_local_gguf()`）。ComfyUI再読み込みで新規配置ファイルが反映される。解決時にキャッシュミスした場合も一度だけ再スキャンしてからエラーにする。
 - **HF VLノード**: `is_vision=True` のチェックポイントのみ列挙。**HF PromptEnhancer**: 全チェックポイントを列挙し、`is_vision` で `_invoke_qwen`（VL流用）と `_invoke_text`（`AutoModelForCausalLM`）を分岐。
-- **GGUF VLノード**: Advancedに `mmproj_name` ドロップダウン（`auto` + スキャンされたmmproj一覧）を追加。`auto` は従来どおりモデルと同ディレクトリの `*mmproj*.gguf` を自動検出。Simpleは常に `auto`。
+- **GGUF VLノード**: Simple/Advanced 両方に `mmproj_name` ドロップダウン（`auto` + スキャンされたmmproj一覧）がある。`auto` は従来どおりモデルと同ディレクトリの `*mmproj*.gguf` を自動検出。Simple側は**後付けなので `required` の最終要素**に置く（既存ワークフローのウィジェット値の並びを崩さないため）。
 - **GGUF PromptEnhancer**: mmproj不要。カタログ由来の `context_length` が無くなったため `ctx` ウィジェット（デフォルト8192）を追加。
 - GGUFのパラメータ既定値（ctx=8192, gpu_layers=-1 等）は `GGUFVLResolved` のdataclassデフォルトが供給し、AdvancedノードのUIで上書きされる。
 - `enforce_memory()` はカタログの `vram_requirement` が無くなったため、ディスク上の重みファイル合計サイズをFP16相当とみなし、8bit=1/2・4bit=1/4 で見積もる。

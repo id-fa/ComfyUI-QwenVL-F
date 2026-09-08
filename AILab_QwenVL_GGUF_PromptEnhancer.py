@@ -99,7 +99,7 @@ class AILab_QwenVL_GGUF_PromptEnhancer:
                 "mtp_draft_tokens": ("INT", {"default": 0, "min": 0, "max": 8, "tooltip": "Multi-token prediction (speculative decoding) from the NextN/MTP heads inside the GGUF — Qwen3.5 / 3.6 / 3.8 MTP builds. 0 disables it, 2 is a good starting point. Needs llama-cpp-python v0.3.48+."}),
                 "english_output": ("BOOLEAN", {"default": False, "tooltip": "Force final output in English using translation prompt."}),
                 "device": (["auto", "cuda", "cpu", "mps"], {"default": "auto", "tooltip": "Select device; auto prefers GPU when available."}),
-                "keep_model_loaded": ("BOOLEAN", {"default": True, "tooltip": "Keep the model in memory after execution. Disable to free VRAM."}),
+                "keep_model_loaded": ("BOOLEAN", {"default": False, "tooltip": "Keep the model in memory after execution. Disable to free VRAM."}),
                 "seed": ("INT", {"default": 1, "min": 1, "max": 2**32 - 1}),
             }
         }
