@@ -2,8 +2,9 @@
 #
 # Prints the pip commands needed to bring a target Python environment up to date
 # with a CUDA build of PyTorch and a vision-capable llama-cpp-python wheel
-# (JamePeng fork). Nothing is installed unless --run is passed; when everything
-# is already current the tool says so instead of emitting a command.
+# (JamePeng fork). It only ever prints: nothing is installed or executed by this
+# script, and when everything is already current it says so instead of emitting
+# a command.
 #
 # torch / torchvision / torchaudio are always planned as one matching set. When the
 # official index publishes no wheel for a package/CUDA/platform combination
@@ -14,12 +15,18 @@
 # Self-contained (standard library only) so it can be dropped into any ComfyUI
 # custom node pack that depends on llama-cpp-python.
 #
+# No installation is ever performed: pip is never invoked. subprocess is used only
+# to read the environment (the target interpreter's version report, `nvidia-smi`,
+# `nvcc --version`), always with an argv list and never with a shell. This keeps the
+# pack in line with the Comfy registry rule that published nodes must not run
+# `pip install` through subprocess.
+#
 # All user-facing output is bilingual (Japanese / English).
 #
 # Usage:
 #   python tools/install_helper.py
 #   python tools/install_helper.py --python "C:/AI/ComfyUI/python_embeded/python.exe"
-#   python tools/install_helper.py --cuda cu130 --run
+#   python tools/install_helper.py --cuda cu130
 #
 # This script follows GPL-3.0 License.
 
@@ -987,7 +994,7 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="例 / Examples:\n"
                "  python tools/install_helper.py\n"
                '  python tools/install_helper.py --python "C:/AI/ComfyUI/python_embeded/python.exe"\n'
-               "  python tools/install_helper.py --cuda cu130 --run\n",
+               "  python tools/install_helper.py --cuda cu130\n",
     )
     parser.add_argument(
         "--python",
@@ -1044,12 +1051,6 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="最新版が導入済みでもコマンドを出力します（再インストール用）。"
              " / Print a command even when everything is current (for a reinstall).",
-    )
-    parser.add_argument(
-        "--run",
-        action="store_true",
-        help="表示した pip コマンドをそのまま実行します（ComfyUI を停止してから使用）。"
-             " / Execute the printed pip commands (stop ComfyUI first).",
     )
     return parser
 
@@ -1134,34 +1135,14 @@ def main(argv=None) -> int:
         "   Stop ComfyUI before running it.",
         indent="",
     )
-
-    if not args.run:
-        log_lines(
-            "※ --run を付けて実行すると、上記コマンドをこのツールが実行します。",
-            "   Re-run with --run to have this tool execute the commands above.",
-            indent="",
-        )
-        return 0
-
-    log("")
+    # このツールは pip を自動実行しない（Comfy レジストリのポリシー上、
+    # 配布ノードからの subprocess 経由 pip install は禁止）。表示されたコマンドを
+    # ユーザー自身がコピーして実行する。
     log_lines(
-        "--run が指定されました。コマンドを実行します。",
-        "--run was given; executing the commands now.",
+        "※ このツールはインストールを行いません。上記をコピーして実行してください。",
+        "   This tool never installs anything; copy the command(s) above and run them yourself.",
         indent="",
     )
-    for command in commands:
-        log("")
-        log(f"$ {command}")
-        result = subprocess.run(command, shell=True)
-        if result.returncode != 0:
-            log_error(
-                f"コマンドが失敗しました (exit={result.returncode})",
-                f"The command failed (exit={result.returncode})",
-                indent="",
-            )
-            return result.returncode
-    log("")
-    log_lines("完了しました。", "Done.", indent="")
     return 0
 
 

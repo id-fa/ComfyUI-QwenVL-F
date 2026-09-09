@@ -16,7 +16,10 @@ pip install -r requirements.txt
 
 `tools/install_helper.py` は CUDA 版 PyTorch と JamePeng fork の `llama-cpp-python` wheel を対象に、
 「今の環境に必要な pip コマンド」を出力する CLI（`--python` で ComfyUI portable の python.exe を指定可能、
-`--run` で実行、最新導入済みならその旨を表示）。torch / torchvision / torchaudio は**常に同一リリースで
+最新導入済みならその旨を表示）。**pip の自動実行機能は持たない**（Comfy レジストリが
+配布ノードからの `subprocess` 経由 `pip install` を禁止しているため、`--run` は撤去済み。
+`subprocess` は対象 Python / `nvidia-smi` / `nvcc` の read-only プローブにのみ使い、
+argv リストで呼び `shell=True` は使わない）。torch / torchvision / torchaudio は**常に同一リリースで
 揃う組み合わせ**として計画する（`TORCH_ALIGNED_PACKAGES`）。公式インデックスに wheel が無い組み合わせ
 （現状 cu132 + Windows の `torchaudio`）は `FALLBACK_WHEEL_SOURCES` の Hugging Face 非公式ビルドで代替し、
 `--no-fallback` 指定時や代替 wheel も無い場合は全部が揃う下位の CUDA インデックスまで下げる

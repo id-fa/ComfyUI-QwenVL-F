@@ -16,10 +16,10 @@
 - **Gemma 4 GGUF 支持**: GGUF 节点通过文件名自动识别 Gemma 模型并切换到 `Gemma4ChatHandler`，跳过 Qwen 专用的 `/think` 前缀注入和 MROPE 图像缩放保护，并从输出中移除 Gemma 的 `<|channel|>` 推理标记。需要 [JamePeng 的 llama-cpp-python v0.3.35+ 分支](https://github.com/JamePeng/llama-cpp-python/discussions/109)。Qwen 模型的行为保持不变。
 - **Qwen3.5 / 3.6 / 3.8 GGUF 支持**: 根据文件名选择对话处理器 —— Qwen3.5 与 Qwen3.6 使用 `Qwen35ChatHandler`，Qwen3.8 使用模板驱动的 `GenericMTMDChatHandler`（读取 GGUF 内嵌的 chat template），旧的 VL 模型仍使用 `Qwen3VLChatHandler` / `Qwen25VLChatHandler`。这些系列通过模板参数 `enable_thinking` 控制思考模式（而非 `/think` 前缀），并会从回答中剥离模板在提示词侧预填的 `<think>`。版本识别仅接受点号或下划线分隔符，因此 `Qwen3-8B` 仍被视为普通的 Qwen3 模型。
 - **MTP（多 token 预测）投机解码**: GGUF Advanced 节点与 GGUF Prompt Enhancer 新增 `mtp_draft_tokens` 控件，可利用 Qwen3.5 / 3.6 / 3.8 MTP 版 GGUF 内置的 NextN/MTP 头进行草稿生成（`0` 为关闭，`2` 是不错的起点）。需要 llama-cpp-python v0.3.48+；该功能仅支持纯文本，因此加载视觉（mmproj）处理器时会自动跳过；若 GGUF 不含 MTP 张量，会回退到普通解码而不会中断工作流。
-- **依赖安装辅助工具（`tools/install_helper.py`）**: 一个命令行工具，用于推算当前环境所需的 `pip install` 命令 —— 包括 CUDA 版 PyTorch 与支持视觉功能的 `llama-cpp-python` wheel —— 并将其打印出来；除非传入 `--run`，否则不会安装任何内容。若全部已是最新版，则显示相应提示而不输出命令。参见[安装指南](docs/LLAMA_CPP_PYTHON_VISION_INSTALL.md)。
+- **依赖安装辅助工具（`tools/install_helper.py`）**: 一个命令行工具，用于推算当前环境所需的 `pip install` 命令 —— 包括 CUDA 版 PyTorch 与支持视觉功能的 `llama-cpp-python` wheel —— 并将其打印出来；本工具自身绝不执行安装，请由您手动运行打印出的命令。若全部已是最新版，则显示相应提示而不输出命令。参见[安装指南](docs/LLAMA_CPP_PYTHON_VISION_INSTALL.md)。
   - **面向指定的解释器**: 传入 `--python "C:\AI\ComfyUI\python_embeded\python.exe"`，报告即针对该环境（Python / ABI 标签、已安装版本）生成，而非运行本脚本的环境。
   - **选择实际存在的构建版本**: CUDA 版本依次通过 `nvidia-smi`（其次为 `nvcc`，再次为 `torch.version.cuda`）获取，然后从 PyTorch 索引与 JamePeng 发布资源中选出不超过该版本的最高构建 —— 因此驱动报告 CUDA 13.3 时仍能解析到已发布的最新 wheel。
-  - **仅提示确有必要的操作**: 输出前先比较版本；同版本但构建不同的情况（例如内置 cu126 的 `2.9.1` 与 `2.9.1+cu130`）会附带原因一并指出。可用选项：`--cuda`、`--force`、`--run`、`--no-torch` / `--no-llama`、`--repo`。
+  - **仅提示确有必要的操作**: 输出前先比较版本；同版本但构建不同的情况（例如内置 cu126 的 `2.9.1` 与 `2.9.1+cu130`）会附带原因一并指出。可用选项：`--cuda`、`--force`、`--no-torch` / `--no-llama`、`--repo`。
 
 ![QwenVL-F_GGUF_Advanced](example_workflows/mod1_adv.png)
 
