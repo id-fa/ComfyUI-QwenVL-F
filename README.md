@@ -4,6 +4,9 @@ This is a fork of [1038lab/ComfyUI-QwenVL](https://github.com/1038lab/ComfyUI-Qw
 
 ## **Fork Changes**
 
+> [!NOTE]
+> With recent ComfyUI updates, what this custom node provides can now be done with ComfyUI's built-in TextGenerate node, so there is no longer much reason to install it.
+
 - **Local-only model discovery (no automatic downloading)**: Every download path has been removed from all six nodes — no `snapshot_download`, no `hf_hub_download`, no background download threads. Model dropdowns are built purely by scanning your disk, so you place models yourself and reload ComfyUI. If a model is missing, the node raises an error listing the folders it looked in instead of starting a download.
   - **Scanned folders**: `ComfyUI/models/text_encoders` and `ComfyUI/models/LLM` by default, both scanned recursively (subfolders included). Configurable via `base_dirs` in `hf_models.json` / `gguf_models.json`; entries can be a `folder_paths` key (so `extra_model_paths.yaml` roots are picked up — `text_encoders` is one of ComfyUI's own), a `ComfyUI/models` subfolder, or an absolute path. Folders are scanned in order and the first match wins on a name clash.
   - **What gets listed**: HF checkpoints are directories holding a `config.json` next to weight shards — the QwenVL nodes list only vision checkpoints (detected from `config.json`), while the Prompt Enhancer lists all of them and picks the text-only or VL code path automatically. GGUF nodes list every `.gguf` by its path relative to its root.
